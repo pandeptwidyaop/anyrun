@@ -10,9 +10,16 @@
 - Trigger check happens at the START of a turn using the context size
   recorded at the END of the previous turn (provider usage is the source of
   truth — no client-side token guessing).
-- Threshold: `ANYRUN_COMPACT_AT` (0..1, default `0.8`) ×
-  `ANYRUN_CONTEXT_WINDOW`. If the window is unset (0), compaction is
-  disabled — no window, no arithmetic.
+- Env names follow Claude Code's own convention so per-model configs work
+  for BOTH drivers unchanged (Kak Pande already sets these on several
+  models; names verified in the leaked source):
+  - window: `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (fallback
+    `ANYRUN_CONTEXT_WINDOW`)
+  - threshold: `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (percent 1–100, fallback
+    `ANYRUN_COMPACT_AT` as a 0..1 fraction; default 80%)
+  - `DISABLE_AUTO_COMPACT=1` turns it off, same as Claude Code
+  If the window resolves to 0, compaction is disabled — no window, no
+  arithmetic.
 - Keep-tail rule: retain the most recent ~25% of messages, but the cut
   must land so the tail starts on a **user message whose first block is
   text** (never split a tool_use from its tool_result pair).
@@ -125,8 +132,12 @@ untouched; summarize failure falls through gracefully.
 
 ### Task 4: wiring + smoke + push
 
-- [ ] `cmd/anyrun/main.go`: parse `ANYRUN_COMPACT_AT` (default 0.8, clamp
-  0..1), pass to Deps. Invalid value → default + stderr note.
+- [ ] `cmd/anyrun/main.go`: resolve window/threshold with the precedence
+  above (CC names first, ANYRUN_* fallback, `DISABLE_AUTO_COMPACT` kill
+  switch), clamp threshold to 0..1, pass to Deps. Invalid values →
+  default + stderr note. The existing `ANYRUN_CONTEXT_WINDOW` read for
+  the result event's `modelUsage.contextWindow` also gains the
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` fallback so the numbers agree.
 - [ ] Smoke (fake provider): session with fat fake meta + long history →
   next turn emits compact_boundary, file shrinks, `.pre-compact` backup
   exists, resume still coherent.
