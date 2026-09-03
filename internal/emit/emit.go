@@ -125,6 +125,12 @@ func (w *Writer) Result(r ResultInfo) error {
 	return w.write(m)
 }
 
+// CompactBoundary mirrors the CLI's compaction marker. claude-agent's
+// parser reads the top-level result field as the summary.
+func (w *Writer) CompactBoundary(summary string) error {
+	return w.write(map[string]any{"type": "compact_boundary", "result": summary})
+}
+
 func (w *Writer) ResultError(msg string, durationMS int64) error {
 	return w.write(map[string]any{
 		"type": "result", "subtype": "error",

@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/pandeptwidyaop/anyrun/internal/compact"
 	"github.com/pandeptwidyaop/anyrun/internal/emit"
 	"github.com/pandeptwidyaop/anyrun/internal/envelope"
 	"github.com/pandeptwidyaop/anyrun/internal/provider"
@@ -25,7 +27,8 @@ type Deps struct {
 	ContextWindow int // from ANYRUN_CONTEXT_WINDOW; 0 = unknown
 	Tools         []provider.ToolDef
 	CallTool      func(ctx context.Context, name string, args json.RawMessage) (string, bool, error)
-	MaxTurns      int // 0 = unlimited
+	MaxTurns      int     // 0 = unlimited
+	CompactAt     float64 // fraction of ContextWindow that triggers compaction; 0 = disabled
 }
 
 func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
@@ -35,10 +38,36 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	if err != nil {
 		return err
 	}
+
+	var total provider.Usage
+	meta, _ := d.Store.LoadMeta(d.SessionID)
+
+	// Compaction check: the previous turn's provider-reported context size
+	// against the configured threshold. Failure degrades to "carry on with
+	// the big context" — never lose the conversation over housekeeping.
+	if d.ContextWindow > 0 && d.CompactAt > 0 &&
+		meta.ContextTokens > int(float64(d.ContextWindow)*d.CompactAt) {
+		if cut := compact.CutIndex(history, 0.25); cut > 0 {
+			summary, u, err := compact.Summarize(ctx, d.Provider, d.Model, history[:cut])
+			total.InputTokens += u.InputTokens
+			total.OutputTokens += u.OutputTokens
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "anyrun: compaction failed, continuing uncompacted: %v\n", err)
+			} else if err := compact.Rewrite(d.Store, d.SessionID, summary, history[cut:]); err != nil {
+				fmt.Fprintf(os.Stderr, "anyrun: compaction rewrite failed: %v\n", err)
+			} else {
+				if history, err = d.Store.Load(d.SessionID); err != nil {
+					return err
+				}
+				_ = d.Emit.CompactBoundary(summary)
+				meta.CompactCount++
+			}
+		}
+	}
+
 	msgs := append(history, userMsg)
 	newMsgs := []envelope.Msg{userMsg}
 
-	var total provider.Usage
 	finalText, stop := "", "end_turn"
 
 	for turn := 0; ; turn++ {
@@ -55,6 +84,9 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 		}
 		total.InputTokens += res.Usage.InputTokens
 		total.OutputTokens += res.Usage.OutputTokens
+		// Context size for the NEXT turn's compaction decision: what the
+		// provider just saw plus what it produced.
+		meta.ContextTokens = res.Usage.InputTokens + res.Usage.OutputTokens
 
 		if err := d.Emit.AssistantTurn(res.Text, res.ToolCalls); err != nil {
 			return err
@@ -95,6 +127,9 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	// effects on a mid-run failure are accepted — same as the real CLI.)
 	if err := d.Store.Append(d.SessionID, newMsgs...); err != nil {
 		return err
+	}
+	if err := d.Store.SaveMeta(d.SessionID, meta); err != nil {
+		fmt.Fprintf(os.Stderr, "anyrun: save meta: %v\n", err)
 	}
 
 	return d.Emit.Result(emit.ResultInfo{

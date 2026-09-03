@@ -130,6 +130,82 @@ func TestAgenticToolLoop(t *testing.T) {
 	}
 }
 
+func TestCompactionTriggersAndPersists(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+
+	// Seed 20 messages of history + a fat meta over the threshold.
+	var seed []envelope.Msg
+	for i := 0; i < 10; i++ {
+		seed = append(seed, userMsg("tanya"), envelope.Msg{Role: "assistant",
+			Content: []json.RawMessage{json.RawMessage(`{"type":"text","text":"jawab"}`)}})
+	}
+	if err := st.Append("s4", seed...); err != nil {
+		t.Fatal(err)
+	}
+	st.SaveMeta("s4", session.Meta{ContextTokens: 900})
+
+	// Script: first Chat = summarization, second = the actual reply.
+	fp := &fakeProvider{script: []provider.Result{
+		{Text: "RINGKASAN penting", StopReason: "end_turn", Usage: provider.Usage{InputTokens: 50, OutputTokens: 5}},
+		{Text: "balasan", StopReason: "end_turn", Usage: provider.Usage{InputTokens: 30, OutputTokens: 4}},
+	}}
+
+	err := Turn(context.Background(), Deps{
+		Provider: fp, Store: st, Emit: emit.New(&out),
+		SessionID: "s4", Model: "m",
+		ContextWindow: 1000, CompactAt: 0.8,
+	}, userMsg("halo lagi"))
+	if err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+
+	s := out.String()
+	if !strings.Contains(s, `"type":"compact_boundary"`) || !strings.Contains(s, "RINGKASAN penting") {
+		t.Errorf("missing compact_boundary event:\n%s", s)
+	}
+
+	msgs, _ := st.Load("s4")
+	if len(msgs) >= 22 {
+		t.Errorf("history not compacted: %d msgs", len(msgs))
+	}
+	if !strings.Contains(string(msgs[0].Content[0]), "Ringkasan percakapan") {
+		t.Errorf("summary not at head: %s", msgs[0].Content[0])
+	}
+
+	meta, _ := st.LoadMeta("s4")
+	if meta.CompactCount != 1 {
+		t.Errorf("compact count = %d, want 1", meta.CompactCount)
+	}
+	if meta.ContextTokens != 34 { // last call: 30 in + 4 out
+		t.Errorf("context tokens = %d, want 34", meta.ContextTokens)
+	}
+	// usage totals include the summarization call: 50+30 / 5+4
+	if !strings.Contains(s, `"input_tokens":80`) || !strings.Contains(s, `"output_tokens":9`) {
+		t.Errorf("usage missing summarization cost:\n%s", s)
+	}
+}
+
+func TestNoCompactionBelowThreshold(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+	st.Append("s5", userMsg("a"))
+	st.SaveMeta("s5", session.Meta{ContextTokens: 100})
+	fp := &fakeProvider{}
+	if err := Turn(context.Background(), Deps{
+		Provider: fp, Store: st, Emit: emit.New(&out),
+		SessionID: "s5", Model: "m", ContextWindow: 1000, CompactAt: 0.8,
+	}, userMsg("b")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "compact_boundary") {
+		t.Error("compaction fired below threshold")
+	}
+	if fp.calls != 1 {
+		t.Errorf("provider calls = %d, want 1", fp.calls)
+	}
+}
+
 func TestMaxTurnsStopsLoop(t *testing.T) {
 	var out bytes.Buffer
 	st := &session.Store{Dir: t.TempDir()}
