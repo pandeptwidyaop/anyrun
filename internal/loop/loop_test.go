@@ -13,10 +13,22 @@ import (
 	"github.com/pandeptwidyaop/anyrun/internal/session"
 )
 
-type fakeProvider struct{ gotMessages int }
+type fakeProvider struct {
+	gotMessages int
+	calls       int
+	script      []provider.Result
+}
 
 func (f *fakeProvider) Chat(_ context.Context, req provider.Request) (provider.Result, error) {
 	f.gotMessages = len(req.Messages)
+	f.calls++
+	if len(f.script) > 0 {
+		res := f.script[0]
+		if len(f.script) > 1 {
+			f.script = f.script[1:]
+		}
+		return res, nil
+	}
 	return provider.Result{Text: "jawaban", StopReason: "end_turn",
 		Usage: provider.Usage{InputTokens: 10, OutputTokens: 2}}, nil
 }
@@ -56,5 +68,90 @@ func TestTurnEmitsAssistantAndResultAndPersists(t *testing.T) {
 	}
 	if fp.gotMessages != 3 {
 		t.Errorf("provider saw %d messages, want 3 (replayed history)", fp.gotMessages)
+	}
+}
+
+func toolScript() []provider.Result {
+	return []provider.Result{
+		{Text: "cek dulu", StopReason: "tool_use",
+			ToolCalls: []provider.ToolCall{{ID: "c1", Name: "mcp__agent__echo", Args: json.RawMessage(`{"msg":"hai"}`)}},
+			Usage:     provider.Usage{InputTokens: 5, OutputTokens: 1}},
+		{Text: "hasilnya: echo hai", StopReason: "end_turn",
+			Usage: provider.Usage{InputTokens: 7, OutputTokens: 3}},
+	}
+}
+
+func TestAgenticToolLoop(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+	fp := &fakeProvider{script: toolScript()}
+
+	var calledName string
+	err := Turn(context.Background(), Deps{
+		Provider: fp, Store: st, Emit: emit.New(&out),
+		SessionID: "s2", Model: "m", System: "sys",
+		Tools: []provider.ToolDef{{Name: "mcp__agent__echo"}},
+		CallTool: func(_ context.Context, name string, args json.RawMessage) (string, bool, error) {
+			calledName = name
+			return "echo: hai", false, nil
+		},
+	}, userMsg("pakai echo"))
+	if err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	if calledName != "mcp__agent__echo" {
+		t.Errorf("tool not called, name=%q", calledName)
+	}
+	if fp.calls != 2 {
+		t.Errorf("provider calls = %d, want 2", fp.calls)
+	}
+
+	s := out.String()
+	iTool := strings.Index(s, `"type":"tool_use"`)
+	iRes := strings.Index(s, `"type":"tool_result"`)
+	iFinal := strings.Index(s, "hasilnya")
+	if !(iTool >= 0 && iRes > iTool && iFinal > iRes) {
+		t.Errorf("event order wrong (tool_use=%d tool_result=%d final=%d):\n%s", iTool, iRes, iFinal, s)
+	}
+	// usage summed across both provider calls: 5+7 in, 1+3 out
+	if !strings.Contains(s, `"input_tokens":12`) || !strings.Contains(s, `"output_tokens":4`) {
+		t.Errorf("usage not summed:\n%s", s)
+	}
+
+	msgs, _ := st.Load("s2")
+	if len(msgs) != 4 { // user, assistant(tool_use), user(tool_result), assistant(final)
+		t.Fatalf("persisted %d msgs, want 4", len(msgs))
+	}
+	if !strings.Contains(string(msgs[1].Content[1]), "tool_use") {
+		t.Errorf("assistant tool_use block not persisted: %v", msgs[1])
+	}
+	if !strings.Contains(string(msgs[2].Content[0]), "tool_result") {
+		t.Errorf("tool_result block not persisted: %v", msgs[2])
+	}
+}
+
+func TestMaxTurnsStopsLoop(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+	// Script forever returns tool calls — only MaxTurns can stop it.
+	fp := &fakeProvider{script: []provider.Result{
+		{StopReason: "tool_use",
+			ToolCalls: []provider.ToolCall{{ID: "c", Name: "mcp__agent__echo", Args: json.RawMessage(`{}`)}}},
+	}}
+	err := Turn(context.Background(), Deps{
+		Provider: fp, Store: st, Emit: emit.New(&out),
+		SessionID: "s3", Model: "m", MaxTurns: 2,
+		CallTool: func(_ context.Context, _ string, _ json.RawMessage) (string, bool, error) {
+			return "ok", false, nil
+		},
+	}, userMsg("loop"))
+	if err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	if fp.calls != 2 {
+		t.Errorf("provider calls = %d, want 2 (capped)", fp.calls)
+	}
+	if !strings.Contains(out.String(), `"stop_reason":"max_turns"`) {
+		t.Errorf("missing max_turns stop reason:\n%s", out.String())
 	}
 }
