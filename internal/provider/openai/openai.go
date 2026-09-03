@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -26,32 +27,90 @@ type Client struct {
 	HTTP    *http.Client
 }
 
-type oaMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+// block is the superset of Anthropic block fields anyrun cares about.
+type block struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
+	ToolUseID string          `json:"tool_use_id"`
+	Content   string          `json:"content"`
 }
 
-// flattenText joins the text blocks of an Anthropic-shaped message.
-// Non-text blocks (image/document) are out of scope in milestone 1 and are
-// replaced by a placeholder so the model at least knows something was there.
-func flattenText(m envelope.Msg) string {
-	var parts []string
+func decodeBlocks(m envelope.Msg) []block {
+	out := make([]block, 0, len(m.Content))
 	for _, raw := range m.Content {
-		var b struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if json.Unmarshal(raw, &b) != nil {
-			continue
-		}
-		switch b.Type {
-		case "text":
-			parts = append(parts, b.Text)
-		default:
-			parts = append(parts, fmt.Sprintf("[unsupported %s block omitted]", b.Type))
+		var b block
+		if json.Unmarshal(raw, &b) == nil {
+			out = append(out, b)
 		}
 	}
-	return strings.Join(parts, "\n")
+	return out
+}
+
+// toOpenAI translates Anthropic-shaped history into chat-completions
+// messages. tool_use lands on the assistant message as tool_calls;
+// each tool_result becomes its own role=tool message (OpenAI's required
+// shape). Non-text user blocks (image/document) become placeholders —
+// media translation is a later milestone.
+func toOpenAI(system string, msgs []envelope.Msg) []map[string]any {
+	out := make([]map[string]any, 0, len(msgs)+1)
+	if system != "" {
+		out = append(out, map[string]any{"role": "system", "content": system})
+	}
+	for _, m := range msgs {
+		blocks := decodeBlocks(m)
+
+		if m.Role == "user" {
+			var toolResults []block
+			var textParts []string
+			for _, b := range blocks {
+				switch b.Type {
+				case "tool_result":
+					toolResults = append(toolResults, b)
+				case "text":
+					textParts = append(textParts, b.Text)
+				default:
+					textParts = append(textParts, fmt.Sprintf("[unsupported %s block omitted]", b.Type))
+				}
+			}
+			for _, tr := range toolResults {
+				out = append(out, map[string]any{
+					"role": "tool", "tool_call_id": tr.ToolUseID, "content": tr.Content,
+				})
+			}
+			if len(textParts) > 0 {
+				out = append(out, map[string]any{"role": "user", "content": strings.Join(textParts, "\n")})
+			}
+			continue
+		}
+
+		// assistant
+		var text []string
+		var toolCalls []map[string]any
+		for _, b := range blocks {
+			switch b.Type {
+			case "text":
+				text = append(text, b.Text)
+			case "tool_use":
+				args := string(b.Input)
+				if args == "" {
+					args = "{}"
+				}
+				toolCalls = append(toolCalls, map[string]any{
+					"id": b.ID, "type": "function",
+					"function": map[string]any{"name": b.Name, "arguments": args},
+				})
+			}
+		}
+		am := map[string]any{"role": "assistant", "content": strings.Join(text, "\n")}
+		if len(toolCalls) > 0 {
+			am["tool_calls"] = toolCalls
+		}
+		out = append(out, am)
+	}
+	return out
 }
 
 func normalizeStop(reason string) string {
@@ -66,18 +125,25 @@ func normalizeStop(reason string) string {
 }
 
 func (c *Client) Chat(ctx context.Context, req provider.Request) (provider.Result, error) {
-	msgs := make([]oaMessage, 0, len(req.Messages)+1)
-	if req.System != "" {
-		msgs = append(msgs, oaMessage{Role: "system", Content: req.System})
-	}
-	for _, m := range req.Messages {
-		msgs = append(msgs, oaMessage{Role: m.Role, Content: flattenText(m)})
-	}
-
-	body, err := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"model":    req.Model,
-		"messages": msgs,
-	})
+		"messages": toOpenAI(req.System, req.Messages),
+	}
+	if len(req.Tools) > 0 {
+		tools := make([]map[string]any, 0, len(req.Tools))
+		for _, d := range req.Tools {
+			tools = append(tools, map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name":        d.Name,
+					"description": d.Description,
+					"parameters":  json.RawMessage(d.Schema),
+				},
+			})
+		}
+		payload["tools"] = tools
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return provider.Result{}, err
 	}
@@ -107,8 +173,17 @@ func (c *Client) Chat(ctx context.Context, req provider.Request) (provider.Resul
 
 	var out struct {
 		Choices []struct {
-			Message      oaMessage `json:"message"`
-			FinishReason string    `json:"finish_reason"`
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
@@ -121,9 +196,27 @@ func (c *Client) Chat(ctx context.Context, req provider.Request) (provider.Resul
 	if len(out.Choices) == 0 {
 		return provider.Result{}, fmt.Errorf("openai: empty choices: %s", string(raw))
 	}
+	choice := out.Choices[0]
+
+	var calls []provider.ToolCall
+	for _, tc := range choice.Message.ToolCalls {
+		args := json.RawMessage(tc.Function.Arguments)
+		if !json.Valid(args) || len(args) == 0 {
+			fmt.Fprintf(os.Stderr, "anyrun: tool call %s: invalid arguments %q, using {}\n", tc.Function.Name, tc.Function.Arguments)
+			args = json.RawMessage(`{}`)
+		}
+		calls = append(calls, provider.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args})
+	}
+
+	stop := normalizeStop(choice.FinishReason)
+	if choice.FinishReason == "tool_calls" || len(calls) > 0 {
+		stop = "tool_use"
+	}
+
 	return provider.Result{
-		Text:       out.Choices[0].Message.Content,
-		StopReason: normalizeStop(out.Choices[0].FinishReason),
+		Text:       choice.Message.Content,
+		ToolCalls:  calls,
+		StopReason: stop,
 		Usage: provider.Usage{
 			InputTokens:  out.Usage.PromptTokens,
 			OutputTokens: out.Usage.CompletionTokens,
