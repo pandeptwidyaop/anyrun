@@ -112,7 +112,7 @@ func run() error {
 		}
 	}
 
-	ctxWindow, _ := strconv.Atoi(os.Getenv("ANYRUN_CONTEXT_WINDOW"))
+	ctxWindow, compactAt := compactionConfig()
 
 	deps := loop.Deps{
 		Provider:      &openai.Client{BaseURL: baseURL, APIKey: apiKey},
@@ -123,6 +123,7 @@ func run() error {
 		System:        system,
 		ContextWindow: ctxWindow,
 		MaxTurns:      cfg.MaxTurns,
+		CompactAt:     compactAt,
 	}
 
 	ctx := context.Background()
@@ -175,6 +176,35 @@ func filterTools(defs []provider.ToolDef, disallowed string) []provider.ToolDef 
 		}
 	}
 	return out
+}
+
+// compactionConfig resolves the context window and compaction threshold.
+// Env names follow Claude Code's own convention so per-model configs work
+// for both drivers unchanged; ANYRUN_* are fallbacks.
+//
+//	window:    CLAUDE_CODE_MAX_CONTEXT_TOKENS > ANYRUN_CONTEXT_WINDOW
+//	threshold: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (1–100) > ANYRUN_COMPACT_AT (0..1) > 0.8
+//	kill switch: DISABLE_AUTO_COMPACT (any non-empty value)
+func compactionConfig() (window int, compactAt float64) {
+	window, _ = strconv.Atoi(os.Getenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
+	if window <= 0 {
+		window, _ = strconv.Atoi(os.Getenv("ANYRUN_CONTEXT_WINDOW"))
+	}
+
+	if os.Getenv("DISABLE_AUTO_COMPACT") != "" {
+		return window, 0
+	}
+	compactAt = 0.8
+	if pct, err := strconv.Atoi(os.Getenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")); err == nil && pct >= 1 && pct <= 100 {
+		return window, float64(pct) / 100
+	}
+	if frac, err := strconv.ParseFloat(os.Getenv("ANYRUN_COMPACT_AT"), 64); err == nil {
+		if frac > 0 && frac <= 1 {
+			return window, frac
+		}
+		fmt.Fprintln(os.Stderr, "anyrun: ANYRUN_COMPACT_AT out of range, using 0.8")
+	}
+	return window, compactAt
 }
 
 // fail mirrors CLI behavior: error result event on stdout, message on

@@ -34,6 +34,45 @@ func TestParseArgsClaudeAgentShape(t *testing.T) {
 	}
 }
 
+func TestCompactionConfig(t *testing.T) {
+	clear := func() {
+		for _, k := range []string{"CLAUDE_CODE_MAX_CONTEXT_TOKENS", "ANYRUN_CONTEXT_WINDOW",
+			"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "ANYRUN_COMPACT_AT", "DISABLE_AUTO_COMPACT"} {
+			t.Setenv(k, "")
+		}
+	}
+
+	clear()
+	w, c := compactionConfig()
+	if w != 0 || c != 0.8 {
+		t.Errorf("defaults wrong: window=%d compactAt=%v", w, c)
+	}
+
+	clear()
+	t.Setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "1000000")
+	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "70")
+	w, c = compactionConfig()
+	if w != 1000000 || c != 0.7 {
+		t.Errorf("CC env not honored: window=%d compactAt=%v", w, c)
+	}
+
+	clear()
+	t.Setenv("ANYRUN_CONTEXT_WINDOW", "128000")
+	t.Setenv("ANYRUN_COMPACT_AT", "0.5")
+	w, c = compactionConfig()
+	if w != 128000 || c != 0.5 {
+		t.Errorf("fallback env not honored: window=%d compactAt=%v", w, c)
+	}
+
+	clear()
+	t.Setenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "1000000")
+	t.Setenv("DISABLE_AUTO_COMPACT", "1")
+	w, c = compactionConfig()
+	if w != 1000000 || c != 0 {
+		t.Errorf("kill switch broken: window=%d compactAt=%v", w, c)
+	}
+}
+
 func TestFilterTools(t *testing.T) {
 	defs := []provider.ToolDef{
 		{Name: "mcp__agent__memory_persist"},
