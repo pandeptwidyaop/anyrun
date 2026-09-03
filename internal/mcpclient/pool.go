@@ -13,13 +13,9 @@ import (
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
-)
 
-type ToolDef struct {
-	Name        string          // mcp__<server>__<tool>
-	Description string
-	Schema      json.RawMessage // JSON Schema from tools/list
-}
+	"github.com/pandeptwidyaop/anyrun/internal/provider"
+)
 
 // rpc is the slice of client.Client the pool uses; a seam for in-process
 // test servers.
@@ -33,7 +29,7 @@ type route struct{ server, tool string }
 
 type Pool struct {
 	clients map[string]rpc
-	defs    []ToolDef
+	defs    []provider.ToolDef
 	routes  map[string]route
 }
 
@@ -84,14 +80,14 @@ func startWithClients(ctx context.Context, clients map[string]rpc) (*Pool, error
 			if err != nil || len(schema) == 0 || string(schema) == "null" {
 				schema = json.RawMessage(`{"type":"object"}`)
 			}
-			p.defs = append(p.defs, ToolDef{Name: full, Description: t.Description, Schema: schema})
+			p.defs = append(p.defs, provider.ToolDef{Name: full, Description: t.Description, Schema: schema})
 			p.routes[full] = route{server: name, tool: t.Name}
 		}
 	}
 	return p, nil
 }
 
-func (p *Pool) Tools() []ToolDef { return p.defs }
+func (p *Pool) Tools() []provider.ToolDef { return p.defs }
 
 // Call executes a prefixed tool. Tool-level failures come back as
 // (content, true, nil) so the model can see and react to them; only

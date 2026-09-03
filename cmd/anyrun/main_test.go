@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/pandeptwidyaop/anyrun/internal/provider"
+)
 
 func TestParseArgsClaudeAgentShape(t *testing.T) {
 	// Exactly what claude-agent's buildArgs produces (order included).
@@ -24,6 +28,28 @@ func TestParseArgsClaudeAgentShape(t *testing.T) {
 	}
 	if cfg.Model != "google/gemini-2.5-pro" || cfg.SystemPromptFile != "/tmp/p.md" {
 		t.Errorf("cfg wrong: %+v", cfg)
+	}
+	if cfg.DisallowedTools != "Workflow" {
+		t.Errorf("disallowedTools not captured: %+v", cfg)
+	}
+}
+
+func TestFilterTools(t *testing.T) {
+	defs := []provider.ToolDef{
+		{Name: "mcp__agent__memory_persist"},
+		{Name: "mcp__agent__knowledge_get"},
+		{Name: "mcp__other__thing"},
+	}
+	out := filterTools(defs, "mcp__agent__*,exact_name")
+	if len(out) != 1 || out[0].Name != "mcp__other__thing" {
+		t.Errorf("glob filter wrong: %+v", out)
+	}
+	out = filterTools(defs, "mcp__other__thing")
+	if len(out) != 2 {
+		t.Errorf("exact filter wrong: %+v", out)
+	}
+	if got := filterTools(defs, ""); len(got) != 3 {
+		t.Errorf("empty filter should pass all: %+v", got)
 	}
 }
 

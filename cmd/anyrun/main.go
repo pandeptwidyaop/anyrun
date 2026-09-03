@@ -10,10 +10,13 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/pandeptwidyaop/anyrun/internal/emit"
 	"github.com/pandeptwidyaop/anyrun/internal/envelope"
 	"github.com/pandeptwidyaop/anyrun/internal/loop"
+	"github.com/pandeptwidyaop/anyrun/internal/mcpclient"
+	"github.com/pandeptwidyaop/anyrun/internal/provider"
 	"github.com/pandeptwidyaop/anyrun/internal/provider/openai"
 	"github.com/pandeptwidyaop/anyrun/internal/session"
 )
@@ -22,10 +25,11 @@ type config struct {
 	SessionID        string
 	Resume           bool
 	SystemPromptFile string
-	MCPConfigFile    string // parsed now, used in the MCP milestone
+	MCPConfigFile    string
 	Model            string
 	MaxTurns         int
 	Verbose          bool
+	DisallowedTools  string // comma-separated globs from --disallowedTools
 }
 
 func parseArgs(args []string) (config, error) {
@@ -44,9 +48,10 @@ func parseArgs(args []string) (config, error) {
 	fs.StringVar(&cfg.MCPConfigFile, "mcp-config", "", "")
 	fs.StringVar(&cfg.Model, "model", "", "")
 	fs.IntVar(&cfg.MaxTurns, "max-turns", 0, "")
-	// Accepted for compatibility, intentionally unused in this milestone.
+	fs.StringVar(&cfg.DisallowedTools, "disallowedTools", "", "")
+	// Accepted for compatibility; anyrun auto-approves everything, so the
+	// approve-only --allowedTools flag has nothing to do here.
 	fs.String("allowedTools", "", "")
-	fs.String("disallowedTools", "", "")
 	fs.Bool("dangerously-skip-permissions", false, "")
 
 	if err := fs.Parse(args); err != nil {
@@ -109,8 +114,7 @@ func run() error {
 
 	ctxWindow, _ := strconv.Atoi(os.Getenv("ANYRUN_CONTEXT_WINDOW"))
 
-	_ = w.Init(cfg.SessionID, cfg.Model)
-	err = loop.Turn(context.Background(), loop.Deps{
+	deps := loop.Deps{
 		Provider:      &openai.Client{BaseURL: baseURL, APIKey: apiKey},
 		Store:         &session.Store{Dir: dir},
 		Emit:          w,
@@ -118,11 +122,59 @@ func run() error {
 		Model:         cfg.Model,
 		System:        system,
 		ContextWindow: ctxWindow,
-	}, userMsg)
-	if err != nil {
+		MaxTurns:      cfg.MaxTurns,
+	}
+
+	ctx := context.Background()
+	if cfg.MCPConfigFile != "" {
+		mcpCfg, err := mcpclient.LoadConfig(cfg.MCPConfigFile)
+		if err != nil {
+			return fail(w, err)
+		}
+		// MCP startup failure is fatal: an agent without its tools must not
+		// silently answer toolless.
+		pool, err := mcpclient.Start(ctx, mcpCfg)
+		if err != nil {
+			return fail(w, err)
+		}
+		defer pool.Close()
+		deps.Tools = filterTools(pool.Tools(), cfg.DisallowedTools)
+		deps.CallTool = pool.Call
+	}
+
+	_ = w.Init(cfg.SessionID, cfg.Model)
+	if err := loop.Turn(ctx, deps, userMsg); err != nil {
 		return fail(w, err)
 	}
 	return nil
+}
+
+// filterTools drops tools matching --disallowedTools patterns. Only the
+// shapes buildArgs produces are supported: exact names and `prefix*` globs.
+func filterTools(defs []provider.ToolDef, disallowed string) []provider.ToolDef {
+	patterns := []string{}
+	for _, p := range strings.Split(disallowed, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			patterns = append(patterns, p)
+		}
+	}
+	if len(patterns) == 0 {
+		return defs
+	}
+	var out []provider.ToolDef
+	for _, d := range defs {
+		blocked := false
+		for _, p := range patterns {
+			if p == d.Name || (strings.HasSuffix(p, "*") && strings.HasPrefix(d.Name, strings.TrimSuffix(p, "*"))) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // fail mirrors CLI behavior: error result event on stdout, message on
