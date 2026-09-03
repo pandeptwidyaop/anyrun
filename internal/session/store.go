@@ -38,6 +38,12 @@ func (s *Store) path(id string) (string, error) {
 	return filepath.Join(s.Dir, id+".jsonl"), nil
 }
 
+// FilePath exposes the JSONL path for a session (used by the compactor's
+// atomic rewrite). Same id validation as every other entry point.
+func (s *Store) FilePath(id string) (string, error) {
+	return s.path(id)
+}
+
 func (s *Store) Load(id string) ([]envelope.Msg, error) {
 	p, err := s.path(id)
 	if err != nil {
