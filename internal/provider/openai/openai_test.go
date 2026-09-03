@@ -141,6 +141,46 @@ func TestChatParsesToolCallResponse(t *testing.T) {
 	}
 }
 
+func TestToolCallRawRoundTrip(t *testing.T) {
+	// Response carries a provider-specific extra field...
+	srv1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"choices":[{"message":{"content":"","tool_calls":[
+			{"id":"c1","type":"function","extra_content":{"google":{"thought_signature":"SIG123"}},
+			 "function":{"name":"t","arguments":"{}"}}
+		]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer srv1.Close()
+	p := &Client{BaseURL: srv1.URL, APIKey: "k"}
+	res, err := p.Chat(context.Background(), provider.Request{Model: "m",
+		Messages: []envelope.Msg{{Role: "user", Content: []json.RawMessage{json.RawMessage(`{"type":"text","text":"x"}`)}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(res.ToolCalls[0].Raw), "SIG123") {
+		t.Fatalf("raw not captured: %s", res.ToolCalls[0].Raw)
+	}
+
+	// ...and history replay must echo it verbatim.
+	var got map[string]any
+	srv2 := fakeServer(t, &got)
+	defer srv2.Close()
+	p2 := &Client{BaseURL: srv2.URL, APIKey: "sk-test"}
+	_, err = p2.Chat(context.Background(), provider.Request{Model: "m",
+		Messages: []envelope.Msg{
+			{Role: "assistant", Content: []json.RawMessage{json.RawMessage(
+				`{"type":"tool_use","id":"c1","name":"t","input":{},"raw_tool_call":{"id":"c1","type":"function","extra_content":{"google":{"thought_signature":"SIG123"}},"function":{"name":"t","arguments":"{}"}}}`)}},
+			{Role: "user", Content: []json.RawMessage{json.RawMessage(`{"type":"tool_result","tool_use_id":"c1","content":"ok"}`)}},
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(got)
+	if !strings.Contains(string(body), "SIG123") {
+		t.Errorf("thought_signature lost in replay:\n%s", body)
+	}
+}
+
 func TestChatSplitsCachedInput(t *testing.T) {
 	cases := []struct{ name, usage string }{
 		{"deepseek", `{"prompt_tokens":21000,"completion_tokens":50,"prompt_cache_hit_tokens":20000}`},

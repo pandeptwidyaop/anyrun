@@ -36,6 +36,9 @@ type block struct {
 	Input     json.RawMessage `json:"input"`
 	ToolUseID string          `json:"tool_use_id"`
 	Content   string          `json:"content"`
+	// RawToolCall is the provider's original tool_call object, stored by
+	// the loop so replay preserves provider-specific fields.
+	RawToolCall json.RawMessage `json:"raw_tool_call"`
 }
 
 func decodeBlocks(m envelope.Msg) []block {
@@ -88,12 +91,18 @@ func toOpenAI(system string, msgs []envelope.Msg) []map[string]any {
 
 		// assistant
 		var text []string
-		var toolCalls []map[string]any
+		var toolCalls []any
 		for _, b := range blocks {
 			switch b.Type {
 			case "text":
 				text = append(text, b.Text)
 			case "tool_use":
+				// Prefer the provider's original object — extra fields like
+				// Gemini 3's thought_signature MUST round-trip or the API 400s.
+				if len(b.RawToolCall) > 0 {
+					toolCalls = append(toolCalls, json.RawMessage(b.RawToolCall))
+					continue
+				}
 				args := string(b.Input)
 				if args == "" {
 					args = "{}"
@@ -174,14 +183,10 @@ func (c *Client) Chat(ctx context.Context, req provider.Request) (provider.Resul
 	var out struct {
 		Choices []struct {
 			Message struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
-					ID       string `json:"id"`
-					Function struct {
-						Name      string `json:"name"`
-						Arguments string `json:"arguments"`
-					} `json:"function"`
-				} `json:"tool_calls"`
+				Content string `json:"content"`
+				// Raw first: providers attach extra fields (Gemini 3's
+				// extra_content.thought_signature) that must survive replay.
+				ToolCalls []json.RawMessage `json:"tool_calls"`
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -205,13 +210,24 @@ func (c *Client) Chat(ctx context.Context, req provider.Request) (provider.Resul
 	choice := out.Choices[0]
 
 	var calls []provider.ToolCall
-	for _, tc := range choice.Message.ToolCalls {
+	for _, raw := range choice.Message.ToolCalls {
+		var tc struct {
+			ID       string `json:"id"`
+			Function struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			} `json:"function"`
+		}
+		if err := json.Unmarshal(raw, &tc); err != nil {
+			fmt.Fprintf(os.Stderr, "anyrun: undecodable tool call skipped: %v\n", err)
+			continue
+		}
 		args := json.RawMessage(tc.Function.Arguments)
 		if !json.Valid(args) || len(args) == 0 {
 			fmt.Fprintf(os.Stderr, "anyrun: tool call %s: invalid arguments %q, using {}\n", tc.Function.Name, tc.Function.Arguments)
 			args = json.RawMessage(`{}`)
 		}
-		calls = append(calls, provider.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args})
+		calls = append(calls, provider.ToolCall{ID: tc.ID, Name: tc.Function.Name, Args: args, Raw: raw})
 	}
 
 	stop := normalizeStop(choice.FinishReason)

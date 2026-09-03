@@ -19,6 +19,10 @@ type ToolCall struct {
 	ID   string
 	Name string
 	Args json.RawMessage // JSON object
+	// Raw is the provider's original tool_call object, replayed verbatim
+	// when history is translated back. Some providers attach extra fields
+	// there that MUST round-trip (e.g. Gemini 3's thought_signature).
+	Raw json.RawMessage
 }
 
 type Request struct {

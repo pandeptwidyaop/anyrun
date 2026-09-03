@@ -157,9 +157,15 @@ func assistantMsg(text string, calls []provider.ToolCall) envelope.Msg {
 		if len(input) == 0 {
 			input = json.RawMessage(`{}`)
 		}
-		b, _ := json.Marshal(map[string]any{
+		block := map[string]any{
 			"type": "tool_use", "id": c.ID, "name": c.Name, "input": input,
-		})
+		}
+		// Provider-specific extras (e.g. Gemini 3 thought signatures) ride
+		// along so history replay can echo the original object verbatim.
+		if len(c.Raw) > 0 {
+			block["raw_tool_call"] = json.RawMessage(c.Raw)
+		}
+		b, _ := json.Marshal(block)
 		content = append(content, b)
 	}
 	return envelope.Msg{Role: "assistant", Content: content}
