@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/pandeptwidyaop/anyrun/internal/provider"
@@ -33,26 +34,23 @@ type Pool struct {
 	routes  map[string]route
 }
 
-// Start spawns every stdio server in cfg, initializes it, and lists tools.
-// A server that fails to start is fatal — an agent without its tools must
-// not silently answer toolless.
+// Start connects every server in cfg (stdio spawn or http/sse dial),
+// initializes it, and lists tools. Individual server failures are soft —
+// warn on stderr and continue with the rest, same as the Claude CLI — but
+// if EVERY configured server fails, that is fatal: an agent without any of
+// its tools must not silently answer toolless.
 func Start(ctx context.Context, cfg Config) (*Pool, error) {
 	clients := make(map[string]rpc, len(cfg.MCPServers))
 	for name, sc := range cfg.MCPServers {
-		if sc.URL != "" || sc.Command == "" {
-			fmt.Fprintf(os.Stderr, "anyrun: skipping non-stdio MCP server %q\n", name)
+		c, err := connect(ctx, sc)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "anyrun: MCP server %q unavailable, skipping: %v\n", name, err)
 			continue
 		}
-		env := os.Environ()
-		for k, v := range sc.Env {
-			env = append(env, k+"="+v)
-		}
-		c, err := client.NewStdioMCPClient(sc.Command, env, sc.Args...)
-		if err != nil {
-			closeAll(clients)
-			return nil, fmt.Errorf("mcpclient: spawn %s: %w", name, err)
-		}
 		clients[name] = c
+	}
+	if len(clients) == 0 && len(cfg.MCPServers) > 0 {
+		return nil, fmt.Errorf("mcpclient: all %d MCP servers failed to start", len(cfg.MCPServers))
 	}
 	p, err := startWithClients(ctx, clients)
 	if err != nil {
@@ -62,17 +60,48 @@ func Start(ctx context.Context, cfg Config) (*Pool, error) {
 	return p, nil
 }
 
+func connect(ctx context.Context, sc ServerConfig) (*client.Client, error) {
+	switch {
+	case sc.URL != "" && sc.Type == "sse":
+		c, err := client.NewSSEMCPClient(sc.URL, client.WithHeaders(sc.Headers))
+		if err != nil {
+			return nil, err
+		}
+		return c, c.Start(ctx)
+	case sc.URL != "": // "http", "streamable-http", or unspecified with a URL
+		c, err := client.NewStreamableHttpClient(sc.URL, transport.WithHTTPHeaders(sc.Headers))
+		if err != nil {
+			return nil, err
+		}
+		return c, c.Start(ctx)
+	case sc.Command != "":
+		env := os.Environ()
+		for k, v := range sc.Env {
+			env = append(env, k+"="+v)
+		}
+		return client.NewStdioMCPClient(sc.Command, env, sc.Args...) // auto-starts
+	default:
+		return nil, fmt.Errorf("neither command nor url configured")
+	}
+}
+
 func startWithClients(ctx context.Context, clients map[string]rpc) (*Pool, error) {
 	p := &Pool{clients: clients, routes: map[string]route{}}
 	for name, c := range clients {
 		if cc, ok := c.(*client.Client); ok && !cc.IsInitialized() {
 			if _, err := cc.Initialize(ctx, mcp.InitializeRequest{}); err != nil {
-				return nil, fmt.Errorf("mcpclient: initialize %s: %w", name, err)
+				fmt.Fprintf(os.Stderr, "anyrun: MCP server %q failed to initialize, skipping: %v\n", name, err)
+				_ = c.Close()
+				delete(p.clients, name)
+				continue
 			}
 		}
 		list, err := c.ListTools(ctx, mcp.ListToolsRequest{})
 		if err != nil {
-			return nil, fmt.Errorf("mcpclient: list tools %s: %w", name, err)
+			fmt.Fprintf(os.Stderr, "anyrun: MCP server %q failed to list tools, skipping: %v\n", name, err)
+			_ = c.Close()
+			delete(p.clients, name)
+			continue
 		}
 		for _, t := range list.Tools {
 			full := "mcp__" + name + "__" + t.Name

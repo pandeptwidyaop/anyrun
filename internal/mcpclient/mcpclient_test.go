@@ -10,6 +10,8 @@ import (
 
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
+	"net/http/httptest"
+
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -56,6 +58,66 @@ func testPool(t *testing.T) *Pool {
 	}
 	t.Cleanup(p.Close)
 	return p
+}
+
+type deadRPC struct{}
+
+func (deadRPC) ListTools(context.Context, mcp.ListToolsRequest) (*mcp.ListToolsResult, error) {
+	return nil, context.DeadlineExceeded
+}
+func (deadRPC) CallTool(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return nil, context.DeadlineExceeded
+}
+func (deadRPC) Close() error { return nil }
+
+func TestDeadServerIsSkippedNotFatal(t *testing.T) {
+	p, err := startWithClients(context.Background(), map[string]rpc{
+		"agent": echoServer(t),
+		"dead":  deadRPC{},
+	})
+	if err != nil {
+		t.Fatalf("dead server must not be fatal: %v", err)
+	}
+	t.Cleanup(p.Close)
+	if len(p.Tools()) != 2 {
+		t.Errorf("live server tools missing: %d", len(p.Tools()))
+	}
+	for _, d := range p.Tools() {
+		if strings.HasPrefix(d.Name, "mcp__dead__") {
+			t.Errorf("dead server leaked tool %s", d.Name)
+		}
+	}
+}
+
+func TestHTTPServerRoundTrip(t *testing.T) {
+	srv := server.NewMCPServer("httpfixture", "1.0")
+	srv.AddTool(
+		mcp.NewTool("ping", mcp.WithDescription("pong")),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if req.Header.Get("X-Test-Key") != "rahasia" {
+				return mcp.NewToolResultError("missing header"), nil
+			}
+			return mcp.NewToolResultText("pong"), nil
+		})
+	httpSrv := httptest.NewServer(server.NewStreamableHTTPServer(srv))
+	defer httpSrv.Close()
+
+	p, err := Start(context.Background(), Config{MCPServers: map[string]ServerConfig{
+		"remote": {URL: httpSrv.URL, Type: "http", Headers: map[string]string{"X-Test-Key": "rahasia"}},
+	}})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	defs := p.Tools()
+	if len(defs) != 1 || defs[0].Name != "mcp__remote__ping" {
+		t.Fatalf("bad defs: %+v", defs)
+	}
+	out, isErr, err := p.Call(context.Background(), "mcp__remote__ping", json.RawMessage(`{}`))
+	if err != nil || isErr || out != "pong" {
+		t.Errorf("http call failed: out=%q isErr=%v err=%v", out, isErr, err)
+	}
 }
 
 func TestToolsArePrefixedWithSchemas(t *testing.T) {

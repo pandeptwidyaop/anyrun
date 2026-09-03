@@ -12,7 +12,9 @@ type ServerConfig struct {
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
 	Env     map[string]string `json:"env"`
-	URL     string            `json:"url"` // non-stdio servers are skipped with a stderr note
+	URL     string            `json:"url"`     // remote servers (http/sse)
+	Type    string            `json:"type"`    // "http" | "sse" | "" (stdio when Command set, http when URL set)
+	Headers map[string]string `json:"headers"` // static headers for remote servers
 }
 
 type Config struct {
