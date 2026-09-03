@@ -38,6 +38,32 @@ forks like btw-claude-agent). Compatibility is defined by that subset.
   Everything else (parser, worker, personality, MCP config generation) is
   untouched.
 
+## Contract corrections (from reading `internal/claude/runner.go`, 3 Sep 2026)
+
+Verified against the actual consumer; these override anything below:
+
+- The system prompt flag is `--system-prompt-file`, not
+  `--append-system-prompt-file`.
+- The parser (`parseStreamLine`) consumes **complete messages only**:
+  `assistant` lines with full `message.content` block arrays (`text`,
+  `thinking`, `tool_use`), `user` lines with `tool_result` blocks, and one
+  final `result` line. It never reads token deltas — anyrun does not need
+  to emit `content_block_delta` at all. One `assistant` line per completed
+  model message is the correct granularity.
+- `result` fields consumed: `result`, `stop_reason`, `total_cost_usd`,
+  `duration_ms`, `is_error`, `errors[]`,
+  `usage{input_tokens,output_tokens,cache_read_input_tokens,cache_creation_input_tokens}`,
+  `modelUsage{<any>:{contextWindow}}`.
+- `buildArgs` also passes `--allowedTools` / `--disallowedTools`; anyrun
+  must accept them (MVP: ignore; later: filter MCP tools by pattern).
+- Binary selection: the runner already honors a `CLAUDE_BIN` env var, but
+  reads it from the parent process env. The claude-agent tweak is: prefer
+  `cfg.AgentEnv["CLAUDE_BIN"]` (per-model env from the `models`
+  collection) over the global lookup. No new concept needed.
+- The worker's idle timer kills the process after `CLAUDE_TIMEOUT_MS`
+  with no stdout output; emitting per completed message (not buffering an
+  entire multi-turn run) keeps the timer fed.
+
 ## CLI surface (the compatibility contract)
 
 Flags accepted, matching claude-agent's `buildArgs()`:
