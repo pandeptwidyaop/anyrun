@@ -141,6 +141,31 @@ func TestChatParsesToolCallResponse(t *testing.T) {
 	}
 }
 
+func TestChatSplitsCachedInput(t *testing.T) {
+	cases := []struct{ name, usage string }{
+		{"deepseek", `{"prompt_tokens":21000,"completion_tokens":50,"prompt_cache_hit_tokens":20000}`},
+		{"openai", `{"prompt_tokens":21000,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":20000}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":` + tc.usage + `}`))
+			}))
+			defer srv.Close()
+			p := &Client{BaseURL: srv.URL, APIKey: "k"}
+			res, err := p.Chat(context.Background(), provider.Request{Model: "m",
+				Messages: []envelope.Msg{{Role: "user", Content: []json.RawMessage{json.RawMessage(`{"type":"text","text":"x"}`)}}}})
+			if err != nil {
+				t.Fatalf("Chat: %v", err)
+			}
+			if res.Usage.InputTokens != 1000 || res.Usage.CacheRead != 20000 || res.Usage.OutputTokens != 50 {
+				t.Errorf("cache split wrong: %+v", res.Usage)
+			}
+		})
+	}
+}
+
 func TestChatSurfacesHTTPErrors(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"invalid api key"}}`, 401)

@@ -97,6 +97,7 @@ type ResultInfo struct {
 	StopReason    string
 	DurationMS    int64
 	InputTokens   int
+	CacheRead     int
 	OutputTokens  int
 	Model         string
 	ContextWindow int // 0 = omit modelUsage
@@ -115,7 +116,7 @@ func (w *Writer) Result(r ResultInfo) error {
 		"usage": map[string]any{
 			"input_tokens":                r.InputTokens,
 			"output_tokens":               r.OutputTokens,
-			"cache_read_input_tokens":     0,
+			"cache_read_input_tokens":     r.CacheRead,
 			"cache_creation_input_tokens": 0,
 		},
 	}

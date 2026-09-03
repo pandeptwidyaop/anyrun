@@ -29,7 +29,8 @@ type Request struct {
 }
 
 type Usage struct {
-	InputTokens  int
+	InputTokens  int // uncached input tokens (claude-CLI semantics: excludes CacheRead)
+	CacheRead    int // input tokens served from the provider's prompt cache
 	OutputTokens int
 }
 

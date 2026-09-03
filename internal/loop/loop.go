@@ -50,6 +50,7 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 		if cut := compact.CutIndex(history, 0.25); cut > 0 {
 			summary, u, err := compact.Summarize(ctx, d.Provider, d.Model, history[:cut])
 			total.InputTokens += u.InputTokens
+			total.CacheRead += u.CacheRead
 			total.OutputTokens += u.OutputTokens
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "anyrun: compaction failed, continuing uncompacted: %v\n", err)
@@ -83,10 +84,11 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 			return err
 		}
 		total.InputTokens += res.Usage.InputTokens
+		total.CacheRead += res.Usage.CacheRead
 		total.OutputTokens += res.Usage.OutputTokens
-		// Context size for the NEXT turn's compaction decision: what the
-		// provider just saw plus what it produced.
-		meta.ContextTokens = res.Usage.InputTokens + res.Usage.OutputTokens
+		// Context size for the NEXT turn's compaction decision: everything
+		// the provider just saw (cached or not) plus what it produced.
+		meta.ContextTokens = res.Usage.InputTokens + res.Usage.CacheRead + res.Usage.OutputTokens
 
 		if err := d.Emit.AssistantTurn(res.Text, res.ToolCalls); err != nil {
 			return err
@@ -137,6 +139,7 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 		StopReason:    stop,
 		DurationMS:    time.Since(start).Milliseconds(),
 		InputTokens:   total.InputTokens,
+		CacheRead:     total.CacheRead,
 		OutputTokens:  total.OutputTokens,
 		Model:         d.Model,
 		ContextWindow: d.ContextWindow,

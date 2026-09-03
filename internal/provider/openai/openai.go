@@ -188,6 +188,12 @@ func (c *Client) Chat(ctx context.Context, req provider.Request) (provider.Resul
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
+			// DeepSeek-style cache reporting.
+			PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+			// OpenAI-style cache reporting.
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
@@ -213,12 +219,25 @@ func (c *Client) Chat(ctx context.Context, req provider.Request) (provider.Resul
 		stop = "tool_use"
 	}
 
+	// Providers report prompt_tokens as the TOTAL input (cached + fresh),
+	// but claude-CLI usage semantics keep them separate — the parser sums
+	// input + cache_read for the context total. Split accordingly.
+	cached := out.Usage.PromptCacheHitTokens
+	if cached == 0 {
+		cached = out.Usage.PromptTokensDetails.CachedTokens
+	}
+	input := out.Usage.PromptTokens - cached
+	if input < 0 {
+		input = 0
+	}
+
 	return provider.Result{
 		Text:       choice.Message.Content,
 		ToolCalls:  calls,
 		StopReason: stop,
 		Usage: provider.Usage{
-			InputTokens:  out.Usage.PromptTokens,
+			InputTokens:  input,
+			CacheRead:    cached,
 			OutputTokens: out.Usage.CompletionTokens,
 		},
 	}, nil
