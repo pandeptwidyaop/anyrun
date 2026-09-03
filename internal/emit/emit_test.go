@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/pandeptwidyaop/anyrun/internal/provider"
 )
 
 func TestAssistantTextShape(t *testing.T) {
@@ -28,6 +30,55 @@ func TestAssistantTextShape(t *testing.T) {
 	if got.Type != "assistant" || len(got.Message.Content) != 1 ||
 		got.Message.Content[0].Type != "text" || got.Message.Content[0].Text != "halo Kak" {
 		t.Errorf("bad shape: %s", buf.String())
+	}
+}
+
+func TestAssistantTurnToolUseShape(t *testing.T) {
+	var buf bytes.Buffer
+	w := New(&buf)
+	err := w.AssistantTurn("mikir dulu", []provider.ToolCall{
+		{ID: "call_1", Name: "mcp__agent__echo", Args: json.RawMessage(`{"msg":"hai"}`)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Message struct {
+			Content []struct {
+				Type  string          `json:"type"`
+				ID    string          `json:"id"`
+				Name  string          `json:"name"`
+				Input json.RawMessage `json:"input"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	if len(got.Message.Content) != 2 {
+		t.Fatalf("blocks = %d, want 2", len(got.Message.Content))
+	}
+	tu := got.Message.Content[1]
+	if tu.Type != "tool_use" || tu.ID != "call_1" || tu.Name != "mcp__agent__echo" {
+		t.Errorf("bad tool_use: %+v", tu)
+	}
+	// input must be a JSON object, not a quoted string
+	if !strings.HasPrefix(strings.TrimSpace(string(tu.Input)), "{") {
+		t.Errorf("input not an object: %s", tu.Input)
+	}
+}
+
+func TestToolResultsShape(t *testing.T) {
+	var buf bytes.Buffer
+	w := New(&buf)
+	if err := w.ToolResults([]ToolResult{{ID: "call_1", Content: "echo: hai"}}); err != nil {
+		t.Fatal(err)
+	}
+	s := buf.String()
+	for _, want := range []string{`"type":"user"`, `"type":"tool_result"`, `"tool_use_id":"call_1"`, `"content":"echo: hai"`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("missing %s in %s", want, s)
+		}
 	}
 }
 

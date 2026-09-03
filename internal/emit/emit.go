@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"io"
 	"sync"
+
+	"github.com/pandeptwidyaop/anyrun/internal/provider"
 )
 
 type Writer struct {
@@ -38,11 +40,54 @@ func (w *Writer) Init(sessionID, model string) error {
 }
 
 func (w *Writer) AssistantText(text string) error {
+	return w.AssistantTurn(text, nil)
+}
+
+// AssistantTurn emits one assistant event: optional text block plus
+// tool_use blocks. input is embedded as a raw JSON object — the parser
+// stringifies it itself.
+func (w *Writer) AssistantTurn(text string, calls []provider.ToolCall) error {
+	content := make([]map[string]any, 0, len(calls)+1)
+	if text != "" {
+		content = append(content, map[string]any{"type": "text", "text": text})
+	}
+	for _, c := range calls {
+		input := json.RawMessage(c.Args)
+		if len(input) == 0 {
+			input = json.RawMessage(`{}`)
+		}
+		content = append(content, map[string]any{
+			"type": "tool_use", "id": c.ID, "name": c.Name, "input": input,
+		})
+	}
 	return w.write(map[string]any{
 		"type": "assistant",
 		"message": map[string]any{
 			"role":    "assistant",
-			"content": []map[string]any{{"type": "text", "text": text}},
+			"content": content,
+		},
+	})
+}
+
+type ToolResult struct {
+	ID      string
+	Content string
+}
+
+// ToolResults emits one user event carrying tool_result blocks, matching
+// what the CLI prints after executing tools.
+func (w *Writer) ToolResults(results []ToolResult) error {
+	content := make([]map[string]any, 0, len(results))
+	for _, r := range results {
+		content = append(content, map[string]any{
+			"type": "tool_result", "tool_use_id": r.ID, "content": r.Content,
+		})
+	}
+	return w.write(map[string]any{
+		"type": "user",
+		"message": map[string]any{
+			"role":    "user",
+			"content": content,
 		},
 	})
 }
