@@ -115,3 +115,37 @@ func TestErrorResultSetsFlagAndErrors(t *testing.T) {
 		t.Errorf("bad error result: %s", s)
 	}
 }
+
+// Compaction is the one pause the caller cannot infer from the stream, so it
+// is announced before the work and marked when it lands.
+func TestCompactEvents(t *testing.T) {
+	var buf bytes.Buffer
+	w := New(&buf)
+	if err := w.CompactStart(120_000, 200_000); err != nil {
+		t.Fatalf("CompactStart: %v", err)
+	}
+	if err := w.CompactBoundary("ringkasan", 120_000); err != nil {
+		t.Fatalf("CompactBoundary: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2", len(lines))
+	}
+	var start map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &start); err != nil {
+		t.Fatalf("start line: %v", err)
+	}
+	if start["type"] != "system" || start["subtype"] != "compact_start" {
+		t.Errorf("start = %v, want system/compact_start", start)
+	}
+	if start["pre_tokens"] != float64(120_000) || start["context_window"] != float64(200_000) {
+		t.Errorf("start carries no sizes: %v", start)
+	}
+	var done map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &done); err != nil {
+		t.Fatalf("boundary line: %v", err)
+	}
+	if done["type"] != "compact_boundary" || done["result"] != "ringkasan" || done["pre_tokens"] != float64(120_000) {
+		t.Errorf("boundary = %v", done)
+	}
+}

@@ -48,6 +48,8 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	if d.ContextWindow > 0 && d.CompactAt > 0 &&
 		meta.ContextTokens > int(float64(d.ContextWindow)*d.CompactAt) {
 		if cut := compact.CutIndex(history, 0.25); cut > 0 {
+			pre := meta.ContextTokens
+			_ = d.Emit.CompactStart(pre, d.ContextWindow)
 			summary, u, err := compact.Summarize(ctx, d.Provider, d.Model, history[:cut])
 			total.InputTokens += u.InputTokens
 			total.CacheRead += u.CacheRead
@@ -60,7 +62,7 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 				if history, err = d.Store.Load(d.SessionID); err != nil {
 					return err
 				}
-				_ = d.Emit.CompactBoundary(summary)
+				_ = d.Emit.CompactBoundary(summary, pre)
 				meta.CompactCount++
 			}
 		}
