@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pandeptwidyaop/anyrun/internal/builtin"
 	"github.com/pandeptwidyaop/anyrun/internal/emit"
 	"github.com/pandeptwidyaop/anyrun/internal/envelope"
 	"github.com/pandeptwidyaop/anyrun/internal/loop"
@@ -30,6 +32,7 @@ type config struct {
 	MaxTurns         int
 	Verbose          bool
 	DisallowedTools  string // comma-separated globs from --disallowedTools
+	AllowBash        bool   // --allow-bash / ANYRUN_ALLOW_BASH=1
 }
 
 func parseArgs(args []string) (config, error) {
@@ -53,6 +56,10 @@ func parseArgs(args []string) (config, error) {
 	// approve-only --allowedTools flag has nothing to do here.
 	fs.String("allowedTools", "", "")
 	fs.Bool("dangerously-skip-permissions", false, "")
+	// Built-in file tools are always on; the shell is not. A host that brokers
+	// shell access itself (and screens the commands) must be able to rely on
+	// anyrun not opening a second, unscreened path.
+	fs.BoolVar(&cfg.AllowBash, "allow-bash", os.Getenv("ANYRUN_ALLOW_BASH") != "", "")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -127,6 +134,18 @@ func run() error {
 	}
 
 	ctx := context.Background()
+
+	// Own file tools first, MCP tools after: anyrun can work on a codebase
+	// with no MCP server in front of it, and where both exist the built-ins
+	// are the cheap local path (no round trip) while MCP reaches everything else.
+	root, err := os.Getwd()
+	if err != nil {
+		return fail(w, err)
+	}
+	bi := &builtin.Set{Root: root, AllowBash: cfg.AllowBash}
+	tools := bi.Defs()
+
+	var mcpCall func(context.Context, string, json.RawMessage) (string, bool, error)
 	if cfg.MCPConfigFile != "" {
 		mcpCfg, err := mcpclient.LoadConfig(cfg.MCPConfigFile)
 		if err != nil {
@@ -139,8 +158,18 @@ func run() error {
 			return fail(w, err)
 		}
 		defer pool.Close()
-		deps.Tools = filterTools(pool.Tools(), cfg.DisallowedTools)
-		deps.CallTool = pool.Call
+		tools = append(tools, pool.Tools()...)
+		mcpCall = pool.Call
+	}
+	deps.Tools = filterTools(tools, cfg.DisallowedTools)
+	deps.CallTool = func(ctx context.Context, name string, args json.RawMessage) (string, bool, error) {
+		if bi.Handles(name) {
+			return bi.Call(ctx, name, args)
+		}
+		if mcpCall != nil {
+			return mcpCall(ctx, name, args)
+		}
+		return fmt.Sprintf("unknown tool %q", name), true, nil
 	}
 
 	_ = w.Init(cfg.SessionID, cfg.Model)

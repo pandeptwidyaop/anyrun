@@ -126,10 +126,22 @@ func (w *Writer) Result(r ResultInfo) error {
 	return w.write(m)
 }
 
+// CompactStart announces that the conversation is about to be summarised.
+// Compaction is a full model call over a slice of the history, so it is the
+// one pause a caller cannot explain from the stream alone — without this the
+// agent simply goes quiet. Emitted before the work starts, never after.
+func (w *Writer) CompactStart(preTokens, window int) error {
+	return w.write(map[string]any{
+		"type": "system", "subtype": "compact_start",
+		"pre_tokens": preTokens, "context_window": window,
+	})
+}
+
 // CompactBoundary mirrors the CLI's compaction marker. claude-agent's
-// parser reads the top-level result field as the summary.
-func (w *Writer) CompactBoundary(summary string) error {
-	return w.write(map[string]any{"type": "compact_boundary", "result": summary})
+// parser reads the top-level result field as the summary; pre_tokens rides
+// along so a caller can report how much context was folded away.
+func (w *Writer) CompactBoundary(summary string, preTokens int) error {
+	return w.write(map[string]any{"type": "compact_boundary", "result": summary, "pre_tokens": preTokens})
 }
 
 func (w *Writer) ResultError(msg string, durationMS int64) error {
