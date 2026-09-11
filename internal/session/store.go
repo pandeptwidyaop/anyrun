@@ -44,6 +44,21 @@ func (s *Store) FilePath(id string) (string, error) {
 	return s.path(id)
 }
 
+// endsWithNewline reports whether the file's final byte is '\n'. Append writes
+// one complete line per message, so a file that does not end in '\n' can only
+// mean the last write was cut short by a kill.
+func endsWithNewline(f *os.File) bool {
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return true // nothing written, nothing torn
+	}
+	buf := make([]byte, 1)
+	if _, err := f.ReadAt(buf, st.Size()-1); err != nil {
+		return true // unreadable tail: let the scanner report the real problem
+	}
+	return buf[0] == '\n'
+}
+
 func (s *Store) Load(id string) ([]envelope.Msg, error) {
 	p, err := s.path(id)
 	if err != nil {
@@ -61,9 +76,17 @@ func (s *Store) Load(id string) ([]envelope.Msg, error) {
 	var msgs []envelope.Msg
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1<<20), 64<<20) // media blocks can be huge
+	complete := endsWithNewline(f)
 	for sc.Scan() {
 		var m envelope.Msg
 		if err := json.Unmarshal(sc.Bytes(), &m); err != nil {
+			// A kill during Append truncates the final line, leaving bytes
+			// that cannot parse. Only a torn LAST line is forgiven; a broken
+			// line anywhere else is real corruption and must surface.
+			if !complete && !sc.Scan() {
+				fmt.Fprintf(os.Stderr, "session %s: dropping torn final line: %v\n", id, err)
+				break
+			}
 			return nil, fmt.Errorf("session %s: corrupt line: %w", id, err)
 		}
 		msgs = append(msgs, m)
