@@ -129,7 +129,7 @@ Test:
 - berkas dengan baris rusak di tengah → tetap error
 - berkas utuh → tidak berubah perilakunya (regresi)
 
-- [ ] red → green → commit `fix(session): tolerate torn final line on load`
+- [x] red → green → commit `fix(session): tolerate torn final line on load` — `8948114`
 
 ---
 
@@ -179,7 +179,7 @@ Test (pakai `fakeProvider` + `script` yang sudah ada di `loop_test.go`):
   yang menjaga retry tidak menduplikasi pesan user.
 - `max_turns` tetap tersimpan lengkap (regresi `TestMaxTurnsStopsLoop`).
 
-- [ ] red → green → commit `fix(loop): flush session state per step, not per turn`
+- [x] red → green → commit `fix(loop): persist session state per step, not per turn` — `5f0089d`
 
 ---
 
@@ -212,7 +212,7 @@ Test:
 - history berakhir `assistant(text)` → tidak berubah
 - history berakhir `user(tool_result)` (kasus `max_turns`) → tidak berubah
 
-- [ ] red → green → commit `fix(loop): repair dangling tool_use on load`
+- [x] red → green → commit `fix(loop): repair dangling tool_use on load` — masuk `5f0089d` (dikerjakan satu paket dengan Task 2; keduanya saling mengunci)
 
 ---
 
@@ -242,7 +242,7 @@ Test:
   ada `Rename` yang memindahkan berkas hidup)
 - `Rewrite` gagal di tengah → berkas lama tetap utuh
 
-- [ ] red → green → commit `fix(compact): close the window where the session file vanishes`
+- [x] red → green → commit `fix(compact): stop moving the live session file during Rewrite` — `7e0e750`
 
 ---
 
