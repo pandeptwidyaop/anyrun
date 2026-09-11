@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -229,5 +230,238 @@ func TestMaxTurnsStopsLoop(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"stop_reason":"max_turns"`) {
 		t.Errorf("missing max_turns stop reason:\n%s", out.String())
+	}
+}
+
+// killProvider serves tool calls until killAfter, then cancels the context —
+// standing in for claude-agent's SIGKILL on timeout.
+type killProvider struct {
+	cancel    context.CancelFunc
+	killAfter int
+	calls     int
+}
+
+func (k *killProvider) Chat(_ context.Context, _ provider.Request) (provider.Result, error) {
+	k.calls++
+	if k.calls > k.killAfter {
+		k.cancel()
+		return provider.Result{}, context.Canceled
+	}
+	return provider.Result{
+		StopReason: "tool_use",
+		ToolCalls:  []provider.ToolCall{{ID: "c", Name: "bash", Args: json.RawMessage(`{}`)}},
+		Usage:      provider.Usage{InputTokens: 10, OutputTokens: 2},
+	}, nil
+}
+
+// The regression test for the reported bug: a run killed mid-flight used to
+// discard the ENTIRE turn, including tools that had already executed.
+func TestKilledRunKeepsCompletedSteps(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	kp := &killProvider{cancel: cancel, killAfter: 2}
+	err := Turn(ctx, Deps{
+		Provider: kp, Store: st, Emit: emit.New(&out),
+		SessionID: "s", Model: "m",
+		CallTool: func(_ context.Context, _ string, _ json.RawMessage) (string, bool, error) {
+			return "ok", false, nil
+		},
+	}, userMsg("kerjakan tugas panjang"))
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+	msgs, err := st.Load("s")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Two completed tool rounds => user + (assistant, tool_result) * 2
+	// The third assistant call never returned, so nothing more is written.
+	if len(msgs) != 5 {
+		t.Fatalf("persisted %d messages, want 5 (steps already done):\n%+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "user" {
+		t.Errorf("msgs[0].Role = %q, want user", msgs[0].Role)
+	}
+	if msgs[len(msgs)-1].Role != "user" {
+		t.Errorf("last message = %q, want the trailing tool_result", msgs[len(msgs)-1].Role)
+	}
+}
+
+// A run killed before the model ever answered must leave nothing: the retried
+// job resends the same user message, and a lone stored userMsg would duplicate.
+func TestKilledBeforeFirstAnswerPersistsNothing(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	kp := &killProvider{cancel: cancel, killAfter: 0}
+	err := Turn(ctx, Deps{
+		Provider: kp, Store: st, Emit: emit.New(&out),
+		SessionID: "s2", Model: "m",
+		CallTool: func(_ context.Context, _ string, _ json.RawMessage) (string, bool, error) {
+			return "ok", false, nil
+		},
+	}, userMsg("halo"))
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+	msgs, err := st.Load("s2")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("persisted %d messages, want 0 (no model answer yet): %+v", len(msgs), msgs)
+	}
+}
+
+// The final answer of a normal turn must still land on disk.
+func TestCompletedTurnPersistsFinalText(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+	if err := Turn(context.Background(), Deps{
+		Provider: &fakeProvider{}, Store: st, Emit: emit.New(&out),
+		SessionID: "s3", Model: "m",
+	}, userMsg("halo")); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	msgs, err := st.Load("s3")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("history = %d, want 2 (user + assistant)", len(msgs))
+	}
+	if msgs[1].Role != "assistant" {
+		t.Errorf("msgs[1].Role = %q, want assistant", msgs[1].Role)
+	}
+}
+
+// --- dangling tool_use repair ---------------------------------------------
+
+func assistantWithToolUse(ids ...string) envelope.Msg {
+	content := []json.RawMessage{rawBlock(`{"type":"text","text":"sebentar"}`)}
+	for _, id := range ids {
+		content = append(content, rawBlock(
+			`{"type":"tool_use","id":"`+id+`","name":"bash","input":{}}`))
+	}
+	return envelope.Msg{Role: "assistant", Content: content}
+}
+
+func rawBlock(s string) json.RawMessage { return json.RawMessage(s) }
+
+// A kill between "assistant asked for a tool" and "the tool reported back" is
+// the one hole incremental persistence opens; the history must be closed before
+// it reaches the provider.
+func TestRepairClosesDanglingToolUse(t *testing.T) {
+	history := []envelope.Msg{
+		userMsg("kerjakan"),
+		assistantWithToolUse("toolu_1"),
+	}
+	got, ok := repairDanglingToolUse(history)
+	if !ok {
+		t.Fatal("want repair for a history ending in tool_use")
+	}
+	if len(got) != 3 {
+		t.Fatalf("history = %d, want 3", len(got))
+	}
+	last := got[2]
+	if last.Role != "user" {
+		t.Errorf("role = %q, want user", last.Role)
+	}
+	var block struct {
+		Type      string `json:"type"`
+		ToolUseID string `json:"tool_use_id"`
+	}
+	if err := json.Unmarshal(last.Content[0], &block); err != nil {
+		t.Fatal(err)
+	}
+	if block.Type != "tool_result" || block.ToolUseID != "toolu_1" {
+		t.Errorf("block = %+v, want tool_result for toolu_1", block)
+	}
+}
+
+// Parallel tool calls interrupted together each need their own result, or the
+// provider still sees unmatched ids.
+func TestRepairHandlesParallelToolCalls(t *testing.T) {
+	got, ok := repairDanglingToolUse([]envelope.Msg{
+		userMsg("kerjakan"),
+		assistantWithToolUse("a", "b", "c"),
+	})
+	if !ok {
+		t.Fatal("want repair")
+	}
+	if len(got) != 3 || len(got[2].Content) != 3 {
+		t.Fatalf("want 3 synthetic results, got %d", len(got[2].Content))
+	}
+	for i, id := range []string{"a", "b", "c"} {
+		var block struct {
+			ToolUseID string `json:"tool_use_id"`
+		}
+		_ = json.Unmarshal(got[2].Content[i], &block)
+		if block.ToolUseID != id {
+			t.Errorf("result %d id = %q, want %q", i, block.ToolUseID, id)
+		}
+	}
+}
+
+// Everything that is NOT a dangling tool_use must pass through untouched.
+func TestRepairLeavesHealthyHistoriesAlone(t *testing.T) {
+	cases := map[string][]envelope.Msg{
+		"empty": {},
+		"assistant text": {userMsg("hai"), envelope.Msg{Role: "assistant",
+			Content: []json.RawMessage{rawBlock(`{"type":"text","text":"halo"}`)}}},
+		"tool_result last": {userMsg("hai"), assistantWithToolUse("t"),
+			envelope.Msg{Role: "user", Content: []json.RawMessage{
+				rawBlock(`{"type":"tool_result","tool_use_id":"t","content":"ok"}`)}}},
+		"user last": {userMsg("hai")},
+	}
+	for name, history := range cases {
+		got, ok := repairDanglingToolUse(history)
+		if ok {
+			t.Errorf("%s: repaired when it should not have", name)
+		}
+		if len(got) != len(history) {
+			t.Errorf("%s: length changed %d -> %d", name, len(history), len(got))
+		}
+	}
+}
+
+// End to end: a session left mid-tool by a previous kill must still resume, and
+// the provider must receive a history whose tool calls are all answered.
+func TestInterruptedSessionResumesWithClosedHistory(t *testing.T) {
+	st := &session.Store{Dir: t.TempDir()}
+	// Exactly what the previous run wrote before it was killed.
+	if err := st.Append("s9", userMsg("kerjakan"),
+		assistantWithToolUse("toolu_9")); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	fp := &fakeProvider{}
+	if err := Turn(context.Background(), Deps{
+		Provider: fp, Store: st, Emit: emit.New(&out),
+		SessionID: "s9", Model: "m",
+	}, userMsg("lanjut")); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+
+	// user, assistant(tool_use), synthetic tool_result, user("lanjut").
+	// Without the repair the provider would see 3 and reject the history.
+	if fp.gotMessages != 4 {
+		t.Errorf("provider saw %d messages, want 4 (incl. the synthetic result)", fp.gotMessages)
+	}
+	// The synthetic result is a view for this run only — not written back.
+	msgs, err := st.Load("s9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 4 {
+		t.Errorf("persisted %d messages, want 4 (synthetic result not persisted)", len(msgs))
 	}
 }

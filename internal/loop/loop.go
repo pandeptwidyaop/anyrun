@@ -31,12 +31,72 @@ type Deps struct {
 	CompactAt     float64 // fraction of ContextWindow that triggers compaction; 0 = disabled
 }
 
+// interruptedNote is what a tool call reports when the run that requested it
+// was killed before it could report back. It is deliberately explicit: the
+// alternative is a model that assumes the tool succeeded.
+const interruptedNote = "run sebelumnya terputus sebelum tool ini selesai — hasilnya tidak diketahui"
+
+// repairDanglingToolUse closes a history that was cut off between an assistant
+// tool_use and its results. This is the one shape incremental persistence can
+// leave behind: the assistant message is written before the tools execute (so a
+// resume knows what was about to happen), which by definition means a kill
+// during tool execution leaves the pair half-written.
+//
+// Left alone, that history is not merely incomplete — OpenAI-compatible
+// providers reject it outright, every tool_call needing a matching tool
+// message, so the session would become unusable rather than resumable.
+//
+// The inserted result is not persisted: it is a view for this run only, and is
+// regenerated if the same interruption happens again.
+func repairDanglingToolUse(history []envelope.Msg) ([]envelope.Msg, bool) {
+	if len(history) == 0 {
+		return history, false
+	}
+	last := history[len(history)-1]
+	if last.Role != "assistant" {
+		return history, false
+	}
+
+	var ids []string
+	for _, raw := range last.Content {
+		var block struct {
+			Type string `json:"type"`
+			ID   string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &block); err != nil {
+			continue
+		}
+		if block.Type == "tool_use" && block.ID != "" {
+			ids = append(ids, block.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return history, false
+	}
+
+	content := make([]json.RawMessage, 0, len(ids))
+	for _, id := range ids {
+		block, err := json.Marshal(map[string]string{
+			"type": "tool_result", "tool_use_id": id, "content": interruptedNote,
+		})
+		if err != nil {
+			return history, false
+		}
+		content = append(content, block)
+	}
+	return append(history, envelope.Msg{Role: "user", Content: content}), true
+}
+
 func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	start := time.Now()
 
 	history, err := d.Store.Load(d.SessionID)
 	if err != nil {
 		return err
+	}
+	if repaired, ok := repairDanglingToolUse(history); ok {
+		fmt.Fprintf(os.Stderr, "anyrun: session %s: repaired dangling tool_use from an interrupted run\n", d.SessionID)
+		history = repaired
 	}
 
 	var total provider.Usage
@@ -69,7 +129,29 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	}
 
 	msgs := append(history, userMsg)
-	newMsgs := []envelope.Msg{userMsg}
+
+	// Session state is persisted per step, not per turn. A run can be killed at
+	// any moment — claude-agent SIGKILLs the whole process group on timeout —
+	// and SIGKILL cannot be caught. Waiting until the loop finishes throws away
+	// every tool call that already ran and had real side effects, which is the
+	// "the agent forgot where it stopped" failure: the work happened, the record
+	// of it did not.
+	//
+	// userMsg rides along with the first assistant message instead of being
+	// written up front. If the run dies before the model answers, nothing is
+	// persisted and a retry re-sends the user message cleanly rather than
+	// duplicating it.
+	pending := []envelope.Msg{userMsg}
+	flush := func() error {
+		if len(pending) == 0 {
+			return nil
+		}
+		if err := d.Store.Append(d.SessionID, pending...); err != nil {
+			return err
+		}
+		pending = pending[:0]
+		return nil
+	}
 
 	finalText, stop := "", "end_turn"
 
@@ -83,6 +165,10 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 			Model: d.Model, System: d.System, Messages: msgs, Tools: d.Tools,
 		})
 		if err != nil {
+			// No flush here on purpose: at this point `pending` can only hold
+			// userMsg, and writing it alone would duplicate the message when
+			// the job is retried. Every completed step was already flushed at
+			// its own boundary, so nothing is lost by returning directly.
 			return err
 		}
 		total.InputTokens += res.Usage.InputTokens
@@ -97,7 +183,12 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 		}
 		aMsg := assistantMsg(res.Text, res.ToolCalls)
 		msgs = append(msgs, aMsg)
-		newMsgs = append(newMsgs, aMsg)
+		// Written before the tools run: "the model decided to call these" is
+		// the record that tells a resumed run where it stopped.
+		pending = append(pending, aMsg)
+		if err := flush(); err != nil {
+			return err
+		}
 
 		if len(res.ToolCalls) == 0 {
 			finalText, stop = res.Text, res.StopReason
@@ -123,13 +214,17 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 		}
 		rMsg := toolResultMsg(results)
 		msgs = append(msgs, rMsg)
-		newMsgs = append(newMsgs, rMsg)
+		// Results land in the same flush as their tool_use pairing requires;
+		// providers reject a tool_call whose tool message never arrives.
+		pending = append(pending, rMsg)
+		if err := flush(); err != nil {
+			return err
+		}
 	}
 
-	// Persist AFTER the run succeeded: a failed provider call must not
-	// leave messages in history the model never saw. (Executed tool side
-	// effects on a mid-run failure are accepted — same as the real CLI.)
-	if err := d.Store.Append(d.SessionID, newMsgs...); err != nil {
+	// Every step already flushed as it completed; this only drains anything a
+	// future edit might leave buffered, so it can never silently go missing.
+	if err := flush(); err != nil {
 		return err
 	}
 	if err := d.Store.SaveMeta(d.SessionID, meta); err != nil {
