@@ -456,13 +456,44 @@ func TestInterruptedSessionResumesWithClosedHistory(t *testing.T) {
 	if fp.gotMessages != 5 {
 		t.Errorf("provider saw %d messages, want 5 (synthetic result + resume note)", fp.gotMessages)
 	}
-	// The synthetic result is a view for this run only — not written back.
+	// The synthetic result MUST be persisted. Leaving the file ending in a bare
+	// assistant(tool_use) means the next flush writes the new user message right
+	// after it, and the following turn carries a tool_call with no tool message
+	// (OpenAI 400). Persisting closes the pair once and for all.
 	msgs, err := st.Load("s9")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(msgs) != 4 {
-		t.Errorf("persisted %d messages, want 4 (synthetic result not persisted)", len(msgs))
+	if len(msgs) != 5 {
+		t.Fatalf("persisted %d messages, want 5 (user, assistant(tool_use), synthetic tool_result, user, assistant)", len(msgs))
+	}
+	if msgs[1].Role != "assistant" || msgs[2].Role != "user" {
+		t.Fatalf("tool_use/tool_result pairing wrong: %q then %q", msgs[1].Role, msgs[2].Role)
+	}
+	var block struct {
+		Type      string `json:"type"`
+		ToolUseID string `json:"tool_use_id"`
+	}
+	if err := json.Unmarshal(msgs[2].Content[0], &block); err != nil {
+		t.Fatal(err)
+	}
+	if block.Type != "tool_result" || block.ToolUseID != "toolu_9" {
+		t.Errorf("msgs[2] = %+v, want synthetic tool_result for toolu_9", block)
+	}
+
+	// A second resume over the now-closed file must load cleanly and send a valid
+	// history to the provider (no dangling tool_call mid-history).
+	fp2 := &fakeProvider{}
+	if err := Turn(context.Background(), Deps{
+		Provider: fp2, Store: st, Emit: emit.New(&out),
+		SessionID: "s9", Model: "m",
+	}, userMsg("lagi")); err != nil {
+		t.Fatalf("second resume: %v", err)
+	}
+	// history(5) + user("lagi") = 6. No resume note this time — the first resume
+	// completed cleanly with a final answer, so the run is not "cut short".
+	if fp2.gotMessages != 6 {
+		t.Errorf("second resume: provider saw %d, want 6 (no dangling tool_call)", fp2.gotMessages)
 	}
 }
 

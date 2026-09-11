@@ -131,6 +131,14 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	repaired := false
 	if closed, ok := repairDanglingToolUse(history); ok {
 		fmt.Fprintf(os.Stderr, "anyrun: session %s: repaired dangling tool_use from an interrupted run\n", d.SessionID)
+		// The repair only fixed the in-memory view. The file still ends with a
+		// dangling assistant(tool_use); if it stays, the next flush appends the
+		// new user message right after it and the resumed history carries a
+		// tool_call with no matching tool message — OpenAI 400 on the next turn.
+		// Persist the synthetic tool_result so the file is always replayable.
+		if err := d.Store.Append(d.SessionID, closed[len(history):]...); err != nil {
+			fmt.Fprintf(os.Stderr, "anyrun: persist repair: %v\n", err)
+		}
 		history = closed
 		repaired = true
 	}
