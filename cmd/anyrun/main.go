@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pandeptwidyaop/anyrun/internal/builtin"
 	"github.com/pandeptwidyaop/anyrun/internal/emit"
@@ -131,6 +132,7 @@ func run() error {
 		ContextWindow: ctxWindow,
 		MaxTurns:      cfg.MaxTurns,
 		CompactAt:     compactAt,
+		TimeBudget:    timeBudgetFromEnv(),
 	}
 
 	ctx := context.Background()
@@ -214,6 +216,19 @@ func filterTools(defs []provider.ToolDef, disallowed string) []provider.ToolDef 
 //	window:    CLAUDE_CODE_MAX_CONTEXT_TOKENS > ANYRUN_CONTEXT_WINDOW
 //	threshold: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (1–100) > ANYRUN_COMPACT_AT (0..1) > 0.8
 //	kill switch: DISABLE_AUTO_COMPACT (any non-empty value)
+//
+// timeBudgetFromEnv reads ANYRUN_TIME_BUDGET_MS: the wall clock this run has
+// before its caller kills it. The caller owns the hard deadline and the only
+// way to communicate it is the environment — anyrun cannot observe it, because
+// expiry arrives as a SIGKILL that cannot be caught.
+func timeBudgetFromEnv() time.Duration {
+	ms, err := strconv.Atoi(os.Getenv("ANYRUN_TIME_BUDGET_MS"))
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 func compactionConfig() (window int, compactAt float64) {
 	window, _ = strconv.Atoi(os.Getenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
 	if window <= 0 {

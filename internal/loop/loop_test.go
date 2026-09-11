@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pandeptwidyaop/anyrun/internal/emit"
 	"github.com/pandeptwidyaop/anyrun/internal/envelope"
@@ -584,4 +585,141 @@ func TestNoResumeNoteForFinishedHistory(t *testing.T) {
 	if fp.gotMessages != 3 {
 		t.Errorf("provider saw %d messages, want 3 (no note)", fp.gotMessages)
 	}
+}
+
+// --- wind-down before the budget expires ------------------------------------
+
+// A cap the model cannot outrun: it calls a tool on every turn, so without the
+// wind-down the loop hits the wall and reports nothing at all.
+func TestWrapUpProducesAnswerBeforeMaxTurns(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+	fp := &toolOnlyProvider{}
+
+	err := Turn(context.Background(), Deps{
+		Provider: fp, Store: st, Emit: emit.New(&out),
+		SessionID: "w", Model: "m", MaxTurns: 10,
+		Tools: []provider.ToolDef{{Name: "bash"}},
+		CallTool: func(_ context.Context, _ string, _ json.RawMessage) (string, bool, error) {
+			return "ok", false, nil
+		},
+	}, userMsg("tugas panjang"))
+	if err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+
+	if !strings.Contains(out.String(), `"stop_reason":"max_turns"`) {
+		t.Errorf("stop reason must say the budget ended the run:\n%s", out.String())
+	}
+	// The closing answer must carry text, not an empty result.
+	if !strings.Contains(out.String(), `"result":"laporan akhir"`) {
+		t.Errorf("the wrapped-up answer must reach the result:\n%s", out.String())
+	}
+	// The closing turn must be offered no tools — that is what forces an answer
+	// instead of another round of calls.
+	if !fp.closingCallHadNoTools {
+		t.Error("the wind-down must withdraw the tools, or the model starts another round")
+	}
+	// It must stop well before burning every turn on tool calls.
+	if fp.calls >= 10 {
+		t.Errorf("provider called %d times; the wind-down should end it earlier", fp.calls)
+	}
+}
+
+// A generous budget must not shorten the run.
+func TestNoWrapUpWhenBudgetIsAmple(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+	if err := Turn(context.Background(), Deps{
+		Provider: &fakeProvider{}, Store: st, Emit: emit.New(&out),
+		SessionID: "n", Model: "m", MaxTurns: 40, TimeBudget: time.Hour,
+	}, userMsg("hai")); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "max_turns") || strings.Contains(out.String(), "time_budget") {
+		t.Errorf("an ample budget must not trigger a wind-down:\n%s", out.String())
+	}
+}
+
+// A tiny cap leaves nothing to conclude, so the note would only waste the turn.
+func TestTinyMaxTurnsDoesNotWrapUp(t *testing.T) {
+	if why := (Deps{MaxTurns: 3}).wrapUpReason(0, 0); why != "" {
+		t.Errorf("MaxTurns=3 must not wind down, got %q", why)
+	}
+	if why := (Deps{MaxTurns: 10}).wrapUpReason(8, 0); why != "max_turns" {
+		t.Errorf("MaxTurns=10 turn=8 must wind down, got %q", why)
+	}
+}
+
+// The clock is the only signal a timeout gives; the tool budget is separate.
+func TestTimeBudgetTriggersWrapUp(t *testing.T) {
+	d := Deps{TimeBudget: 10 * time.Minute}
+	if why := d.wrapUpReason(0, 5*time.Minute); why != "" {
+		t.Errorf("half the budget spent is not the end, got %q", why)
+	}
+	if why := d.wrapUpReason(0, 10*time.Minute-wrapUpReserve); why != "time_budget" {
+		t.Errorf("inside the reserve must wind down, got %q", why)
+	}
+	// Too small to be worth splitting.
+	if why := (Deps{TimeBudget: time.Minute}).wrapUpReason(0, time.Minute); why != "" {
+		t.Errorf("a one-minute budget has nothing to conclude, got %q", why)
+	}
+}
+
+// A wrapped-up run must leave a record of where it stopped: the closing text is
+// what a resumed run reads to continue.
+func TestWrapUpAnswerIsPersisted(t *testing.T) {
+	var out bytes.Buffer
+	st := &session.Store{Dir: t.TempDir()}
+	if err := Turn(context.Background(), Deps{
+		Provider: &toolOnlyProvider{}, Store: st, Emit: emit.New(&out),
+		SessionID: "wp", Model: "m", MaxTurns: 10,
+		Tools: []provider.ToolDef{{Name: "bash"}},
+		CallTool: func(_ context.Context, _ string, _ json.RawMessage) (string, bool, error) {
+			return "ok", false, nil
+		},
+	}, userMsg("tugas panjang")); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := st.Load("wp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := msgs[len(msgs)-1]
+	if last.Role != "assistant" {
+		t.Fatalf("last persisted message = %q, want the closing answer", last.Role)
+	}
+	if !strings.Contains(string(last.Content[0]), "laporan akhir") {
+		t.Errorf("closing answer not persisted: %s", last.Content[0])
+	}
+	// The wind-down note is guidance for that run only.
+	for _, m := range msgs {
+		for _, raw := range m.Content {
+			if strings.Contains(string(raw), "Anggaran langkah/waktu") {
+				t.Error("wind-down note leaked into the session file")
+			}
+		}
+	}
+}
+
+// toolOnlyProvider never answers in text on its own — it always asks for another
+// tool, so only the wind-down can end the run. Once the tools are withdrawn it
+// produces the closing report.
+type toolOnlyProvider struct {
+	calls                 int
+	closingCallHadNoTools bool
+}
+
+func (p *toolOnlyProvider) Chat(_ context.Context, req provider.Request) (provider.Result, error) {
+	p.calls++
+	if len(req.Tools) == 0 {
+		p.closingCallHadNoTools = true
+		return provider.Result{Text: "laporan akhir", StopReason: "end_turn",
+			Usage: provider.Usage{InputTokens: 10, OutputTokens: 5}}, nil
+	}
+	return provider.Result{
+		StopReason: "tool_use",
+		ToolCalls:  []provider.ToolCall{{ID: "c", Name: "bash", Args: json.RawMessage(`{}`)}},
+		Usage:      provider.Usage{InputTokens: 10, OutputTokens: 2},
+	}, nil
 }

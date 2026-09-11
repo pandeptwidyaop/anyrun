@@ -101,14 +101,47 @@ is not a concern — anyrun run straight from a terminal, say — turn it on.
 | `ANYRUN_CONTEXT_WINDOW` / `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | Context size used to decide when to compact. |
 | `ANYRUN_COMPACT_AT` / `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | Fraction (0–1) or percent (1–100) of the window that triggers compaction; default `0.8`. |
 | `DISABLE_AUTO_COMPACT` | Any non-empty value turns compaction off. |
+| `ANYRUN_TIME_BUDGET_MS` | Wall clock this run has before its caller kills it, in milliseconds. Set by the caller that owns the deadline — see [Sessions and compaction](#sessions-and-compaction). |
 
 ## Sessions and compaction
 
-Each turn is appended to the session file, so `--resume` continues exactly
-where the last one stopped. When the conversation approaches the configured
-context window, the oldest quarter is summarised by the model and replaced by
-that summary; if summarising fails the turn carries on uncompacted rather than
-losing the conversation.
+`--resume` continues where the last run stopped. Sessions are written **per
+step, not per turn**: the assistant message is appended as soon as it arrives
+(before its tools execute) and the tool results as soon as they return. A run
+killed mid-flight therefore leaves behind every step it completed.
+
+This matters because the kill is not cooperative. A host that enforces a
+timeout SIGKILLs the process group, which cannot be caught, so nothing runs at
+exit and whatever was not written yet is gone. Per-step writes bound that loss
+to one step instead of the whole turn.
+
+Three consequences worth knowing:
+
+- **The file can end mid-step**, with a `tool_use` whose results never arrived.
+  That shape is rejected by OpenAI-compatible providers, so `--resume` closes it
+  by appending a `tool_result` saying the run was interrupted and the outcome is
+  unknown. The pair is written once and stays closed.
+- **A resumed run is told it is resuming.** When the history shows unfinished
+  work, a note precedes the new message: the completed steps above are real, the
+  request may be a redelivery, continue rather than start over. Without it a
+  retried job repeats work that already happened — harmless for a read, not for
+  a push.
+- **A run near its budget is told to conclude.** Within two turns of
+  `--max-turns`, or within `ANYRUN_TIME_BUDGET_MS` minus a 90-second reserve,
+  anyrun injects a note asking for a closing report and withdraws the tools so
+  the model answers rather than starting another round. The result carries
+  `stop_reason` `max_turns` or `time_budget`, and the answer says what is done
+  and what is left.
+
+None of the injected notes are persisted — they are guidance for one run, so
+they cannot pile up in the file.
+
+When the conversation approaches the configured context window, the oldest
+quarter is summarised by the model and replaced by that summary; if summarising
+fails the turn carries on uncompacted rather than losing the conversation. The
+session file is copied to `<id>.jsonl.pre-compact` first, and the new content
+swapped in with a single `rename` — no step removes the live file, so a kill
+during compaction cannot lose the history.
 
 ## MCP servers
 

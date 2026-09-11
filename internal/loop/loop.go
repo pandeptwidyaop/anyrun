@@ -29,12 +29,62 @@ type Deps struct {
 	CallTool      func(ctx context.Context, name string, args json.RawMessage) (string, bool, error)
 	MaxTurns      int     // 0 = unlimited
 	CompactAt     float64 // fraction of ContextWindow that triggers compaction; 0 = disabled
+	// TimeBudget is the wall clock this run has before the caller kills it, as
+	// reported by ANYRUN_TIME_BUDGET_MS. anyrun cannot discover the deadline
+	// itself: when it expires the process is SIGKILLed, and that cannot be
+	// caught. Winding down before it arrives is the only way to finish with a
+	// report instead of nothing. 0 = no budget known.
+	TimeBudget time.Duration
 }
 
 // interruptedNote is what a tool call reports when the run that requested it
 // was killed before it could report back. It is deliberately explicit: the
 // alternative is a model that assumes the tool succeeded.
 const interruptedNote = "run sebelumnya terputus sebelum tool ini selesai — hasilnya tidak diketahui"
+
+// wrapUpNote is injected once the run is about to run out of turns or time. A
+// budget that expires mid-work leaves nothing behind but a truncated history:
+// no summary, no statement of what is left. Asking for a closing report costs
+// one turn and turns a dead end into a handoff.
+const wrapUpNote = "[catatan] Anggaran langkah/waktu run ini hampir habis. JANGAN memulai pekerjaan baru. " +
+	"Selesaikan yang sedang berjalan bila memang perlu, lalu berikan jawaban akhir SEKARANG: apa yang " +
+	"SUDAH selesai, apa yang BELUM, dan langkah berikutnya yang paling masuk akal. Jawaban ini yang akan " +
+	"dibaca run selanjutnya — tanpa itu, pekerjaan yang sudah dilakukan terlihat seperti belum dimulai."
+
+const (
+	// wrapUpTurns is how many turns before the cap the wind-down starts. Two
+	// leaves room for one last tool round and then the written report.
+	wrapUpTurns = 2
+	// wrapUpReserve is the slice of time held back for the closing report. A
+	// tool starting with less than this on the clock will not finish before the
+	// kill, so the remaining time is better spent answering.
+	wrapUpReserve = 90 * time.Second
+	// Guards against winding down a run whose entire budget is tiny: a one-step
+	// job has nothing to conclude, and the note would only waste a turn.
+	minTurnsForWrapUp  = 5
+	minBudgetForWrapUp = 3 * time.Minute
+)
+
+// noteMsg builds a user message carrying an out-of-band instruction. Notes are
+// shown to the provider for the current run only and never persisted, so they
+// cannot pile up in the session file.
+func noteMsg(text string) envelope.Msg {
+	b, _ := json.Marshal(map[string]string{"type": "text", "text": text})
+	return envelope.Msg{Role: "user", Content: []json.RawMessage{b}}
+}
+
+// wrapUpReason reports why the run must start concluding, or "" to carry on.
+// Turn budget is checked first: it is exact, while the clock is an estimate of
+// when the caller will give up.
+func (d Deps) wrapUpReason(turn int, elapsed time.Duration) string {
+	if d.MaxTurns > minTurnsForWrapUp && turn >= d.MaxTurns-wrapUpTurns {
+		return "max_turns"
+	}
+	if d.TimeBudget > minBudgetForWrapUp && elapsed >= d.TimeBudget-wrapUpReserve {
+		return "time_budget"
+	}
+	return ""
+}
 
 // repairDanglingToolUse closes a history that was cut off between an assistant
 // tool_use and its results. This is the one shape incremental persistence can
@@ -176,8 +226,7 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	// accumulate, and the file keeps the real record.
 	msgs := history
 	if repaired || historyWasCutShort(history) {
-		note, _ := json.Marshal(map[string]string{"type": "text", "text": resumeNote})
-		msgs = append(msgs, envelope.Msg{Role: "user", Content: []json.RawMessage{note}})
+		msgs = append(msgs, noteMsg(resumeNote))
 	}
 	msgs = append(msgs, userMsg)
 
@@ -205,15 +254,31 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	}
 
 	finalText, stop := "", "end_turn"
+	// wrapUpWhy records that the run was cut short by its budget rather than
+	// finishing its task; it becomes the reported stop reason.
+	wrapUpWhy := ""
 
 	for turn := 0; ; turn++ {
 		if d.MaxTurns > 0 && turn >= d.MaxTurns {
+			// Only reachable if the wind-down above did not run (a tiny cap, or
+			// a model that ignored the note and kept calling tools).
 			stop = "max_turns"
 			break
 		}
 
+		tools := d.Tools
+		if why := d.wrapUpReason(turn, time.Since(start)); why != "" && wrapUpWhy == "" {
+			wrapUpWhy = why
+			fmt.Fprintf(os.Stderr, "anyrun: session %s: winding down at turn %d (%s)\n", d.SessionID, turn, why)
+			msgs = append(msgs, noteMsg(wrapUpNote))
+			// Withdrawing the tools is what makes the wind-down reliable: left
+			// available, the model starts another round and the budget expires
+			// mid-call, which is the outcome this exists to prevent.
+			tools = nil
+		}
+
 		res, err := d.Provider.Chat(ctx, provider.Request{
-			Model: d.Model, System: d.System, Messages: msgs, Tools: d.Tools,
+			Model: d.Model, System: d.System, Messages: msgs, Tools: tools,
 		})
 		if err != nil {
 			// No flush here on purpose: at this point `pending` can only hold
@@ -243,6 +308,11 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 
 		if len(res.ToolCalls) == 0 {
 			finalText, stop = res.Text, res.StopReason
+			if wrapUpWhy != "" {
+				// The wording is the model's; the reason it stopped is the
+				// budget, not a finished task. Both matter to the reader.
+				stop = wrapUpWhy
+			}
 			break
 		}
 		if d.CallTool == nil {
