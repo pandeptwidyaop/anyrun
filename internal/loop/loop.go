@@ -87,6 +87,40 @@ func repairDanglingToolUse(history []envelope.Msg) ([]envelope.Msg, bool) {
 	return append(history, envelope.Msg{Role: "user", Content: content}), true
 }
 
+// resumeNote is injected when the history shows a run that never finished.
+// Without it the model has the facts but no reason to trust them: a redelivered
+// request (the worker retries a timed-out job with the identical message) reads
+// as a fresh instruction, so the model starts over and repeats work that
+// already happened. With side effects attached, repeating is destructive.
+const resumeNote = "[catatan] Run sebelumnya terputus sebelum selesai. Riwayat di atas " +
+	"memuat langkah yang SUDAH dijalankan beserta hasilnya. Permintaan di bawah " +
+	"mungkin pengiriman ulang dari permintaan yang sama. Jangan mengulangi langkah " +
+	"yang sudah selesai — lanjutkan dari yang belum, dan sebutkan mana yang sudah beres."
+
+// historyWasCutShort reports whether the history ends mid-run: either an
+// assistant tool_use left unanswered, or a tool result the model never got to
+// react to. Both mean the last thing on record is work in progress, not an
+// answer.
+func historyWasCutShort(history []envelope.Msg) bool {
+	if len(history) == 0 {
+		return false
+	}
+	last := history[len(history)-1]
+	if last.Role != "user" {
+		return false
+	}
+	if len(last.Content) == 0 {
+		return false
+	}
+	var block struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(last.Content[0], &block) != nil {
+		return false
+	}
+	return block.Type == "tool_result"
+}
+
 func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	start := time.Now()
 
@@ -94,9 +128,11 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 	if err != nil {
 		return err
 	}
-	if repaired, ok := repairDanglingToolUse(history); ok {
+	repaired := false
+	if closed, ok := repairDanglingToolUse(history); ok {
 		fmt.Fprintf(os.Stderr, "anyrun: session %s: repaired dangling tool_use from an interrupted run\n", d.SessionID)
-		history = repaired
+		history = closed
+		repaired = true
 	}
 
 	var total provider.Usage
@@ -128,7 +164,14 @@ func Turn(ctx context.Context, d Deps, userMsg envelope.Msg) error {
 		}
 	}
 
-	msgs := append(history, userMsg)
+	// The note is a view for this run only — never persisted, so it cannot
+	// accumulate, and the file keeps the real record.
+	msgs := history
+	if repaired || historyWasCutShort(history) {
+		note, _ := json.Marshal(map[string]string{"type": "text", "text": resumeNote})
+		msgs = append(msgs, envelope.Msg{Role: "user", Content: []json.RawMessage{note}})
+	}
+	msgs = append(msgs, userMsg)
 
 	// Session state is persisted per step, not per turn. A run can be killed at
 	// any moment — claude-agent SIGKILLs the whole process group on timeout —

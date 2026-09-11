@@ -451,10 +451,10 @@ func TestInterruptedSessionResumesWithClosedHistory(t *testing.T) {
 		t.Fatalf("Turn: %v", err)
 	}
 
-	// user, assistant(tool_use), synthetic tool_result, user("lanjut").
+	// user, assistant(tool_use), synthetic tool_result, resume note, user("lanjut").
 	// Without the repair the provider would see 3 and reject the history.
-	if fp.gotMessages != 4 {
-		t.Errorf("provider saw %d messages, want 4 (incl. the synthetic result)", fp.gotMessages)
+	if fp.gotMessages != 5 {
+		t.Errorf("provider saw %d messages, want 5 (synthetic result + resume note)", fp.gotMessages)
 	}
 	// The synthetic result is a view for this run only — not written back.
 	msgs, err := st.Load("s9")
@@ -463,5 +463,94 @@ func TestInterruptedSessionResumesWithClosedHistory(t *testing.T) {
 	}
 	if len(msgs) != 4 {
 		t.Errorf("persisted %d messages, want 4 (synthetic result not persisted)", len(msgs))
+	}
+}
+
+// --- resume note -----------------------------------------------------------
+
+// A tool result the model never got to react to means the run died mid-flight —
+// the shape the worker sees when it retries a timed-out job.
+func TestCutShortHistoryEndingInToolResult(t *testing.T) {
+	history := []envelope.Msg{
+		userMsg("kerjakan"),
+		assistantWithToolUse("t"),
+		{Role: "user", Content: []json.RawMessage{
+			rawBlock(`{"type":"tool_result","tool_use_id":"t","content":"ok"}`)}},
+	}
+	if !historyWasCutShort(history) {
+		t.Error("history ending in tool_result is unfinished work")
+	}
+}
+
+func TestFinishedHistoryIsNotCutShort(t *testing.T) {
+	cases := map[string][]envelope.Msg{
+		"empty": {},
+		"assistant text last": {userMsg("hai"), {Role: "assistant",
+			Content: []json.RawMessage{rawBlock(`{"type":"text","text":"halo"}`)}}},
+		"user last": {userMsg("hai")},
+	}
+	for name, history := range cases {
+		if historyWasCutShort(history) {
+			t.Errorf("%s: must not be treated as cut short", name)
+		}
+	}
+}
+
+// The note is the difference between the model reading the history and acting
+// on it. Without it a redelivered request restarts from scratch.
+func TestResumeNoteInjectedForCutShortHistory(t *testing.T) {
+	st := &session.Store{Dir: t.TempDir()}
+	if err := st.Append("s1", userMsg("kerjakan"), assistantWithToolUse("t"),
+		envelope.Msg{Role: "user", Content: []json.RawMessage{
+			rawBlock(`{"type":"tool_result","tool_use_id":"t","content":"ok"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	fp := &fakeProvider{}
+	if err := Turn(context.Background(), Deps{
+		Provider: fp, Store: st, Emit: emit.New(&out), SessionID: "s1", Model: "m",
+	}, userMsg("kerjakan")); err != nil {
+		t.Fatal(err)
+	}
+	// 3 stored + note + redelivered request
+	if fp.gotMessages != 5 {
+		t.Fatalf("provider saw %d messages, want 5 (note injected)", fp.gotMessages)
+	}
+
+	// The note must not be persisted: it is guidance, not history.
+	msgs, err := st.Load("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range msgs {
+		for _, raw := range m.Content {
+			if strings.Contains(string(raw), "Run sebelumnya terputus") {
+				t.Errorf("resume note leaked into the session file: %s", raw)
+			}
+		}
+	}
+	// 3 stored + the redelivered request + the answer the fake provider gave
+	if len(msgs) != 5 {
+		t.Errorf("persisted %d messages, want 5", len(msgs))
+	}
+}
+
+// A clean history must not be annotated — the note would be a lie.
+func TestNoResumeNoteForFinishedHistory(t *testing.T) {
+	st := &session.Store{Dir: t.TempDir()}
+	if err := st.Append("s2", userMsg("hai"), envelope.Msg{Role: "assistant",
+		Content: []json.RawMessage{rawBlock(`{"type":"text","text":"halo"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	fp := &fakeProvider{}
+	if err := Turn(context.Background(), Deps{
+		Provider: fp, Store: st, Emit: emit.New(&out), SessionID: "s2", Model: "m",
+	}, userMsg("lanjut")); err != nil {
+		t.Fatal(err)
+	}
+	if fp.gotMessages != 3 {
+		t.Errorf("provider saw %d messages, want 3 (no note)", fp.gotMessages)
 	}
 }

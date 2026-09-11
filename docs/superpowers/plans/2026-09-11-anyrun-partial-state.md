@@ -246,15 +246,51 @@ Test:
 
 ---
 
+### Task 6: penanda lanjut untuk run yang terputus
+
+Ditemukan saat uji langsung Task 5, bukan dari membaca kode.
+
+**Masalah:** setelah fix Task 2, riwayat memang memuat langkah yang sudah selesai —
+tapi model belum tentu memakainya. Jalur auto-retry worker mengirim ulang pesan
+yang **sama persis**, dan tanpa penanda model membacanya sebagai perintah baru:
+
+```
+[tool] UNIT-1   ← diulang, padahal sudah selesai di run sebelumnya
+```
+
+Kalau yang diulang punya efek samping (`git push`, deploy, kirim email), mengulang
+itu merusak — bukan sekadar boros.
+
+**Files:** `internal/loop/loop.go` + `internal/loop/loop_test.go`
+
+Kalau riwayat berakhir di tengah run (`tool_result` terakhir, atau baru saja
+diperbaiki dari `tool_use` menggantung), sisipkan satu pesan `user` berisi catatan
+sebelum pesan masuk: langkah yang sudah selesai ada di atas, permintaan di bawah
+mungkin pengiriman ulang, jangan ulangi yang sudah beres.
+
+Catatan ini **tidak ditulis ke berkas** — sama seperti `tool_result` sintetis, ia
+hanya pandangan untuk run ini. Riwayat tetap berisi rekaman asli.
+
+Bukti sebelum/sesudah (uji langsung, sesi yang sama):
+
+| | Kalimat pertama | Tool dipanggil ulang |
+|---|---|---|
+| tanpa catatan | *"saya ulang dari UNIT-1"* | UNIT-1..6 (semua) |
+| dengan catatan | *"UNIT-1,2,3 sudah beres. UNIT-4 terputus — saya ulang dari situ"* | UNIT-4,5,6 |
+
+- [x] red → green → commit `fix(loop): tell the model it is resuming, not starting over`
+
+---
+
 ### Task 5: verifikasi menyeluruh + dokumentasi
 
-- [ ] `go build ./...` && `go test ./...` — semua lulus
-- [ ] Jalankan uji manual: jalankan anyrun dengan tugas multi-turn, SIGKILL di
-      tengah jalan, lalu `--resume` dengan pesan baru. Konfirmasi berkas sesi
-      berisi langkah-langkah yang sudah dijalankan dan resume tidak error.
-- [ ] Perbarui `README.md` — bagian sesi: jelaskan bahwa status ditulis per
-      langkah, apa arti `tool_result` sintetis, dan bahwa berkas boleh berakhir
-      di tengah turn.
+- [x] `go build ./...` && `go test ./...` — semua lulus (9 paket)
+- [x] Uji manual (11 Sep, sesi nyata): SIGKILL di tengah run 8 langkah → 7 pesan
+      bertahan (UNIT-1..3 lengkap). Resume dengan pesan baru → model melaporkan
+      tahap selesai, tahap terputus (belum terverifikasi), dan tahap belum jalan.
+      Binary: `/home/devops/.local/bin/anyrun` (dipasang atomic via rename).
+- [ ] Perbarui `README.md` — bagian sesi: status ditulis per langkah,
+      `tool_result` sintetis, catatan lanjut, dan berkas boleh berakhir di tengah turn.
 - [ ] Commit `docs: document partial-state persistence semantics`
 
 ---
