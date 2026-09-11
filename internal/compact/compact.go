@@ -5,7 +5,9 @@ package compact
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/pandeptwidyaop/anyrun/internal/envelope"
@@ -105,10 +107,38 @@ func Rewrite(st *session.Store, id, summary string, tail []envelope.Msg) error {
 		os.Remove(tmp)
 		return err
 	}
-	// Keep one backup for manual recovery, then swap atomically.
-	if err := os.Rename(old, old+".pre-compact"); err != nil {
+	// Back the previous content up by COPYING it, never by moving it: renaming
+	// the live file away leaves a window with no session file at all, and a
+	// process killed inside that window loses the whole history — the one
+	// failure here that is unrecoverable rather than merely inconvenient.
+	if err := copyFile(old, old+".pre-compact"); err != nil {
 		os.Remove(tmp)
 		return err
 	}
+	// Rename is atomic on POSIX: the file is either the old content or the new
+	// one, never absent and never partial.
 	return os.Rename(tmp, old)
+}
+
+// copyFile duplicates src to dst with 0600. A missing src is not an error:
+// there is nothing to preserve, and the rewrite is still valid.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }

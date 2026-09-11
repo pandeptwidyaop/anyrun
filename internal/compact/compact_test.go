@@ -3,6 +3,7 @@ package compact
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -123,5 +124,78 @@ func TestSummarizeAndRewrite(t *testing.T) {
 	// backup exists
 	if _, err := st.Load("s1"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The session file must never be absent, not even momentarily. The previous
+// implementation renamed the live file away before putting the new one in
+// place: a kill inside that window lost the entire history, and nothing else
+// on disk could rebuild it.
+func TestRewriteKeepsLiveFileAndBacksUpOldContent(t *testing.T) {
+	st := &session.Store{Dir: t.TempDir()}
+	msgs := plainHistory(20)
+	if err := st.Append("s1", msgs...); err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.Load("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Rewrite(st, "s1", "RINGKASAN", msgs[16:]); err != nil {
+		t.Fatalf("Rewrite: %v", err)
+	}
+
+	// Live file holds the new, shorter history.
+	after, err := st.Load("s1")
+	if err != nil {
+		t.Fatalf("live session file unreadable after Rewrite: %v", err)
+	}
+	if len(after) != 5 {
+		t.Errorf("live history = %d, want 5", len(after))
+	}
+
+	// Backup holds the PREVIOUS content — that is what makes it a backup.
+	p, err := st.FilePath("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup, err := os.ReadFile(p + ".pre-compact")
+	if err != nil {
+		t.Fatalf("backup missing: %v", err)
+	}
+	lines := strings.Count(strings.TrimSpace(string(backup)), "\n") + 1
+	if lines != len(before) {
+		t.Errorf("backup has %d lines, want the previous %d", lines, len(before))
+	}
+}
+
+// A Rewrite that fails before the atomic swap must leave the old history intact.
+func TestRewriteFailureLeavesOldHistoryIntact(t *testing.T) {
+	st := &session.Store{Dir: t.TempDir()}
+	msgs := plainHistory(20)
+	if err := st.Append("s1", msgs...); err != nil {
+		t.Fatal(err)
+	}
+	p, err := st.FilePath("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make the backup step fail: .pre-compact exists as a directory, so
+	// opening it as a file cannot succeed.
+	if err := os.MkdirAll(p+".pre-compact", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := Rewrite(st, "s1", "RINGKASAN", msgs[16:]); err == nil {
+		t.Fatal("want error when the backup cannot be written")
+	}
+
+	got, err := st.Load("s1")
+	if err != nil {
+		t.Fatalf("old history must survive a failed Rewrite: %v", err)
+	}
+	if len(got) != len(msgs) {
+		t.Errorf("history = %d, want the original %d", len(got), len(msgs))
 	}
 }
