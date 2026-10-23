@@ -67,6 +67,21 @@ size, and a wrong snippet fails loudly instead of half-applying.
 Relative paths resolve against the working directory anyrun was started in;
 absolute paths and `~/…` are used as given.
 
+`--tools` narrows the built-ins the same way the Claude CLI flag does: absent,
+every built-in above is on (bash still opt-in); `--tools ""` turns them all off
+and leaves only MCP tools; `--tools "read_file,list_dir"` keeps just those.
+It can only narrow the set — naming `bash` there does not enable it without
+`--allow-bash` — and unknown names are ignored.
+
+### Hidden tools are refused, not just hidden
+
+Tools removed by `--tools` or `--disallowedTools` are not only left out of the
+list sent to the model: a call to any tool outside that final list — a removed
+built-in, a filtered MCP tool, or a name the model made up — is answered with
+an error result (`tool "read_file" is not available`) and never executed. A
+model can emit a call to a tool it was never shown, whether by hallucination or
+because a prompt-injected message asked it to.
+
 ### Why bash is opt-in
 
 `bash` only appears with `--allow-bash` (or `ANYRUN_ALLOW_BASH=1`). A host that
@@ -83,10 +98,12 @@ is not a concern — anyrun run straight from a terminal, say — turn it on.
 | `--system-prompt-file` | File whose contents become the system prompt. |
 | `--max-turns` | Stop after this many model turns; `0` = unlimited. |
 | `--mcp-config` | JSON file describing MCP servers to connect. |
-| `--disallowedTools` | Comma-separated tool names or `prefix*` globs to hide from the model. |
+| `--tools` | Built-in tools to keep, comma-separated; `""` disables every built-in (MCP tools remain); absent = all built-ins. |
+| `--disallowedTools` | Comma-separated tool names or `prefix*` globs to hide from the model; calls to them are refused. |
 | `--allow-bash` | Enable the built-in `bash` tool. |
 | `--verbose` | Extra diagnostics on stderr. |
 | `--print`, `--output-format`, `--input-format` | Claude CLI compatibility; only `stream-json` in and out is supported. |
+| `--tools` (Claude CLI semantics) | Same contract as the Claude CLI flag — `""` means no built-in tools — but takes anyrun's built-in names (`read_file`, `edit_file`, `write_file`, `list_dir`, `bash`), not Claude's (`Read`, `Bash`, …). |
 | `--allowedTools`, `--dangerously-skip-permissions` | Accepted and ignored: anyrun does not gate tools behind approval. |
 
 ## Environment

@@ -1,6 +1,6 @@
 // Package builtin gives anyrun its own file tools, so it can work on a
-// codebase without an MCP server in front of it. The four file tools are
-// always on; bash is opt-in (--allow-bash) because a host that already
+// codebase without an MCP server in front of it. The four file tools are on
+// unless --tools narrows them; bash is opt-in (--allow-bash) because a host that already
 // brokers shell access screens the commands it runs, and a second,
 // unscreened path through anyrun would quietly bypass those rules.
 package builtin

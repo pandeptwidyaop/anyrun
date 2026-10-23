@@ -34,7 +34,23 @@ type config struct {
 	Verbose          bool
 	DisallowedTools  string // comma-separated globs from --disallowedTools
 	AllowBash        bool   // --allow-bash / ANYRUN_ALLOW_BASH=1
+	// Tools is the --tools built-in allowlist: nil when the flag is absent
+	// (every built-in), "" to disable them all, or a comma-separated list.
+	Tools *string
 }
+
+// optString is a string flag that remembers whether it was given at all, so
+// --tools "" (no built-ins) can be told apart from no --tools (all of them).
+type optString struct{ v *string }
+
+func (o *optString) String() string {
+	if o.v == nil {
+		return ""
+	}
+	return *o.v
+}
+
+func (o *optString) Set(s string) error { o.v = &s; return nil }
 
 func parseArgs(args []string) (config, error) {
 	fs := flag.NewFlagSet("anyrun", flag.ContinueOnError)
@@ -53,11 +69,13 @@ func parseArgs(args []string) (config, error) {
 	fs.StringVar(&cfg.Model, "model", "", "")
 	fs.IntVar(&cfg.MaxTurns, "max-turns", 0, "")
 	fs.StringVar(&cfg.DisallowedTools, "disallowedTools", "", "")
+	var tools optString
+	fs.Var(&tools, "tools", "")
 	// Accepted for compatibility; anyrun auto-approves everything, so the
 	// approve-only --allowedTools flag has nothing to do here.
 	fs.String("allowedTools", "", "")
 	fs.Bool("dangerously-skip-permissions", false, "")
-	// Built-in file tools are always on; the shell is not. A host that brokers
+	// Built-in file tools are on unless --tools narrows them; the shell is not. A host that brokers
 	// shell access itself (and screens the commands) must be able to rely on
 	// anyrun not opening a second, unscreened path.
 	fs.BoolVar(&cfg.AllowBash, "allow-bash", os.Getenv("ANYRUN_ALLOW_BASH") != "", "")
@@ -65,6 +83,7 @@ func parseArgs(args []string) (config, error) {
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
+	cfg.Tools = tools.v
 	if outputFormat != "stream-json" || inputFormat != "stream-json" {
 		return config{}, fmt.Errorf("anyrun: only stream-json in/out is supported")
 	}
@@ -145,7 +164,7 @@ func run() error {
 		return fail(w, err)
 	}
 	bi := &builtin.Set{Root: root, AllowBash: cfg.AllowBash}
-	tools := bi.Defs()
+	tools := selectBuiltins(bi.Defs(), cfg.Tools)
 
 	var mcpCall func(context.Context, string, json.RawMessage) (string, bool, error)
 	if cfg.MCPConfigFile != "" {
@@ -164,7 +183,30 @@ func run() error {
 		mcpCall = pool.Call
 	}
 	deps.Tools = filterTools(tools, cfg.DisallowedTools)
-	deps.CallTool = func(ctx context.Context, name string, args json.RawMessage) (string, bool, error) {
+	deps.CallTool = dispatch(deps.Tools, bi, mcpCall)
+
+	_ = w.Init(cfg.SessionID, cfg.Model)
+	if err := loop.Turn(ctx, deps, userMsg); err != nil {
+		return fail(w, err)
+	}
+	return nil
+}
+
+type toolCaller = func(ctx context.Context, name string, args json.RawMessage) (string, bool, error)
+
+// dispatch routes a tool call to the built-ins or MCP, but only for tools in
+// exposed — the final set the model was offered. Hiding a definition is not a
+// boundary: a model can still emit a call to a tool it never saw, whether it
+// hallucinated the name or a prompt-injected message steered it there.
+func dispatch(exposed []provider.ToolDef, bi *builtin.Set, mcpCall toolCaller) toolCaller {
+	allowed := make(map[string]bool, len(exposed))
+	for _, d := range exposed {
+		allowed[d.Name] = true
+	}
+	return func(ctx context.Context, name string, args json.RawMessage) (string, bool, error) {
+		if !allowed[name] {
+			return fmt.Sprintf("tool %q is not available", name), true, nil
+		}
 		if bi.Handles(name) {
 			return bi.Call(ctx, name, args)
 		}
@@ -173,12 +215,26 @@ func run() error {
 		}
 		return fmt.Sprintf("unknown tool %q", name), true, nil
 	}
+}
 
-	_ = w.Init(cfg.SessionID, cfg.Model)
-	if err := loop.Turn(ctx, deps, userMsg); err != nil {
-		return fail(w, err)
+// selectBuiltins applies --tools to the built-in definitions: nil keeps them
+// all, "" drops them all, a list keeps only the names it contains. It can only
+// narrow the set, so bash still needs --allow-bash to appear at all.
+func selectBuiltins(defs []provider.ToolDef, tools *string) []provider.ToolDef {
+	if tools == nil {
+		return defs
 	}
-	return nil
+	keep := map[string]bool{}
+	for _, n := range strings.Split(*tools, ",") {
+		keep[strings.TrimSpace(n)] = true
+	}
+	var out []provider.ToolDef
+	for _, d := range defs {
+		if keep[d.Name] {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // filterTools drops tools matching --disallowedTools patterns. Only the
